@@ -12,6 +12,8 @@ A macOS app that watches a git branch and, whenever it moves, builds the app and
 
 This builds `build/Orchard.app` and copies it to `~/Applications`. You can also open `Package.swift` in Xcode and run it.
 
+Run the tests with `swift test`. CI runs them, plus the app bundle build, on every pull request.
+
 ## Using it
 
 1. **+** to add a pipeline, then **Choose…** a local clone of the repo.
