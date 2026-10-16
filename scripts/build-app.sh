@@ -12,6 +12,15 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Orchard"
 
+# Compile the Icon Composer (Liquid Glass) icon into Assets.car + AppIcon.icns.
+# actool needs absolute paths: it hands the work to a helper with a different cwd.
+if ! out=$(xcrun actool "$PWD/Resources/AppIcon.icon" --compile "$PWD/$APP/Contents/Resources" \
+    --app-icon AppIcon --platform macosx --target-device mac --minimum-deployment-target 15.0 \
+    --output-partial-info-plist "$PWD/build/AppIcon-partial.plist" 2>&1); then
+    echo "$out" >&2
+    exit 1
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -22,6 +31,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>se.ambi.Orchard</string>
     <key>CFBundleExecutable</key><string>Orchard</string>
     <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundleIconName</key><string>AppIcon</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
