@@ -1,0 +1,44 @@
+name: Release
+
+# Every push to main (i.e. every merged PR) builds a DMG and publishes it as a
+# GitHub release tagged v<VERSION>(<run number>), e.g. v1.0.0(42).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build DMG
+        id: build
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          DMG="$(./scripts/build-dmg.sh | tail -n 1)"
+          {
+            echo "tag=v$VERSION($BUILD_NUMBER)"
+            echo "dmg=$DMG"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.build.outputs.tag }}
+          DMG: ${{ steps.build.outputs.dmg }}
+        run: |
+          gh release create "$TAG" "$DMG" \
+            --target "$GITHUB_SHA" \
+            --title "Orchard $TAG" \
+            --generate-notes
