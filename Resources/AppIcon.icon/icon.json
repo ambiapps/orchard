@@ -1,0 +1,63 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "display-p3:0.20000,0.62000,0.38000,1.00000",
+      "display-p3:0.06000,0.36000,0.22000,1.00000"
+    ]
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "glass": true,
+          "image-name": "Branch.svg",
+          "name": "Branch"
+        }
+      ],
+      "name": "Branch",
+      "refractivity": {
+        "depth": 0.6,
+        "enabled": true,
+        "strength": 1
+      },
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.6
+      }
+    },
+    {
+      "layers": [
+        {
+          "glass": true,
+          "image-name": "Leaf.svg",
+          "name": "Leaf"
+        }
+      ],
+      "name": "Leaf",
+      "refractivity": {
+        "depth": 1,
+        "enabled": true,
+        "strength": 1
+      },
+      "shadow": {
+        "kind": "layer-color",
+        "opacity": 0.5
+      },
+      "specular": true,
+      "translucency": {
+        "enabled": true,
+        "value": 0.55
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

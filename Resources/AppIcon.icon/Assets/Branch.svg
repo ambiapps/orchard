@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g transform="rotate(40 512 512)">
+    <g fill="none" stroke="#FFFFFF" stroke-width="44" stroke-linecap="round">
+      <path d="M512 880 L512 340"/>
+      <path d="M512 590 C 512 515 612 515 612 440"/>
+    </g>
+    <g fill="#FFFFFF">
+      <circle cx="512" cy="330" r="50"/>
+      <circle cx="612" cy="430" r="50"/>
+      <circle cx="512" cy="590" r="50"/>
+    </g>
+  </g>
+</svg>
