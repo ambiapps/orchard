@@ -12,6 +12,8 @@ A macOS app that watches a git branch and, whenever it moves, builds the app and
 
 This builds `build/Orchard.app` and copies it to `~/Applications`. You can also open `Package.swift` in Xcode and run it.
 
+Run the tests with `swift test`. CI runs them, plus the app bundle build, on every pull request.
+
 ## Releases
 
 Every push to `main` builds a DMG (`./scripts/build-dmg.sh`) and publishes it as a [GitHub release](https://github.com/ambiapps/orchard/releases) tagged `v<version>(<build>)`, e.g. `v1.0.0(42)`. The version comes from [`VERSION`](VERSION); the build number is the CI run number. The app is ad-hoc signed, not notarized, so after the first launch attempt allow it in **System Settings › Privacy & Security › Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/Orchard.app`).
