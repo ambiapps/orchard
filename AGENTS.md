@@ -29,9 +29,14 @@ Sources/Orchard/
     PipelineDetailView.swift  Settings form (repo, branch, container, scheme, configuration, devices, interval)
     ActivityView.swift        Run history and live log
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
-scripts/build-app.sh          Builds build/Orchard.app (release, ad-hoc signed); --install copies to ~/Applications
+VERSION                       Marketing version (CFBundleShortVersionString); bump it here
+scripts/build-app.sh          Builds build/Orchard.app (release, ad-hoc signed); --install copies to ~/Applications.
+                              BUILD_NUMBER env sets CFBundleVersion (default 1)
+scripts/build-dmg.sh          Builds the app and packages build/Orchard-<version>-<build>.dmg
 docs/                         README screenshots (light/dark)
 .github/workflows/ci.yml      CI: `swift test` + `scripts/build-app.sh` on macos-26
+.github/workflows/release.yml On every push to main: test, build the DMG, publish a GitHub release
+                              tagged v<VERSION>(<run number>), e.g. v1.0.0(42), with the DMG attached
 ```
 
 ## How a run works
