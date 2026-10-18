@@ -29,11 +29,12 @@ Sources/Orchard/
     PipelineDetailView.swift  Settings form (repo, branch, container, scheme, configuration, devices, interval)
     ActivityView.swift        Run history and live log
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
+Resources/AppIcon.icon/       Liquid Glass app icon (Icon Composer document: icon.json + SVG layers)
 VERSION                       Marketing version (CFBundleShortVersionString); bump it here
-scripts/build-app.sh          Builds build/Orchard.app (release, ad-hoc signed); --install copies to ~/Applications.
-                              BUILD_NUMBER env sets CFBundleVersion (default 1)
+scripts/build-app.sh          Builds build/Orchard.app (release, ad-hoc signed, icon compiled with actool);
+                              --install copies to ~/Applications. BUILD_NUMBER env sets CFBundleVersion (default 1)
 scripts/build-dmg.sh          Builds the app and packages build/Orchard-<version>-<build>.dmg
-docs/                         README screenshots (light/dark)
+docs/                         README screenshots (light/dark), app-icon/ previews
 .github/workflows/ci.yml      CI: `swift test` + `scripts/build-app.sh` on macos-26
 .github/workflows/release.yml On every push to main: test, build the DMG, publish a GitHub release
                               tagged v<VERSION>(<run number>), e.g. v1.0.0(42), with the DMG attached
@@ -72,6 +73,7 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 - **Never touch the user's checkout** beyond `git fetch`. All builds happen in the private worktree.
 - **Run every external command through `Shell`**. It provides the login-shell PATH, cancellation and log streaming. Use absolute paths for system tools (`/usr/bin/git`, `/usr/bin/xcrun`, `/usr/bin/xcodebuild`).
 - **Concurrency:** Swift 6 language mode with strict concurrency. `AppStore` and `PipelineRunner` are `@MainActor @Observable`. Log callbacks are `@Sendable` and may be called off the main actor.
+- **App icon:** edit `Resources/AppIcon.icon` in Icon Composer (or its `icon.json`/SVGs directly). `build-app.sh` passes `actool` absolute paths, because it resolves relative ones in a helper process with a different cwd.
 - Keep `README.md` and the screenshots in `docs/` current when you change behavior or UI. The marketing site is a separate repo, [ambiapps/orchard-web](https://github.com/ambiapps/orchard-web). Update it when you add or change user-facing features.
 
 ## Workflow
