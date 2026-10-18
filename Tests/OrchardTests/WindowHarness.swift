@@ -44,13 +44,11 @@ final class WindowHarness {
     func close() { window.close() }
 }
 
-/// An `AppStore` backed by throwaway defaults, so tests never see or change the user's pipelines.
+/// An in-memory `AppStore` without device discovery: tests never see or change the user's
+/// pipelines, write nothing to disk, and don't depend on the host's devices.
 @MainActor
 func makeTestStore(pipelines: Int = 1) -> AppStore {
-    let suite = "OrchardTests-\(UUID().uuidString)"
-    let defaults = UserDefaults(suiteName: suite)!
-    defaults.removePersistentDomain(forName: suite)
-    let store = AppStore(defaults: defaults)
+    let store = AppStore(defaults: nil, discoversDevices: false)
     for _ in 0..<pipelines { store.addPipeline() }
     return store
 }

@@ -11,24 +11,24 @@ struct PipelineDetailView: View {
 
     var body: some View {
         ActivityView(runner: runner)
-        .toolbar {
-            ToolbarItemGroup {
-                if runner.status.isBusy && runner.status != .checking {
-                    Button("Cancel", systemImage: "stop.fill") { runner.cancelRun() }
-                } else {
-                    Button("Build & Deploy Now", systemImage: "hammer") { runner.buildNow() }
-                        .disabled(runner.config.missingSetup != nil || runner.status.isBusy)
+            .toolbar {
+                ToolbarItemGroup {
+                    if runner.status.isBusy && runner.status != .checking {
+                        Button("Cancel", systemImage: "stop.fill") { runner.cancelRun() }
+                    } else {
+                        Button("Build & Deploy Now", systemImage: "hammer") { runner.buildNow() }
+                            .disabled(runner.config.missingSetup != nil || runner.status.isBusy)
+                    }
+                    Toggle(isOn: $runner.config.isEnabled) {
+                        Label(runner.config.isEnabled ? "Enabled" : "Enable",
+                              systemImage: runner.config.isEnabled ? "dot.radiowaves.left.and.right" : "power")
+                    }
+                    .toggleStyle(.button)
+                    .tint(runner.config.isEnabled ? .green : nil)
+                    .disabled(runner.config.missingSetup != nil && !runner.config.isEnabled)
+                    .help(runner.config.missingSetup ?? "Poll the branch and deploy every new commit")
                 }
-                Toggle(isOn: $runner.config.isEnabled) {
-                    Label(runner.config.isEnabled ? "Enabled" : "Enable",
-                          systemImage: runner.config.isEnabled ? "dot.radiowaves.left.and.right" : "power")
-                }
-                .toggleStyle(.button)
-                .tint(runner.config.isEnabled ? .green : nil)
-                .disabled(runner.config.missingSetup != nil && !runner.config.isEnabled)
-                .help(runner.config.missingSetup ?? "Poll the branch and deploy every new commit")
             }
-        }
     }
 }
 

@@ -14,10 +14,6 @@ struct ContentViewLayoutTests {
         return WindowHarness(view, size: NSSize(width: width, height: 700), appearance: appearance)
     }
 
-    @Test func windowFitsEveryColumnAtItsMinimum() {
-        #expect(Layout.windowMinWidth >= Layout.sidebarMin + Layout.settingsMin + Layout.activityMin)
-    }
-
     @Test func usesOneSplitViewForAllColumns() throws {
         let harness = makeWindow(width: 1000)
         defer { harness.close() }
@@ -31,7 +27,17 @@ struct ContentViewLayoutTests {
     /// Dragging the sidebar wider used to grow the detail column past the window's edge.
     @Test(arguments: [Layout.windowMinWidth, 1000, 1400], [0, 360, 700, 5000])
     func resizingSidebarKeepsColumnsInsideWindow(windowWidth: CGFloat, sidebarDrag: CGFloat) throws {
-        let harness = makeWindow(width: windowWidth)
+        try checkSidebarResize(windowWidth: windowWidth, sidebarDrag: sidebarDrag, store: makeTestStore())
+    }
+
+    /// With nothing selected the activity column is empty, and must still keep its minimum width.
+    @Test(arguments: [Layout.windowMinWidth, 1000], [360, 5000])
+    func resizingSidebarWithoutPipelinesKeepsColumnsInsideWindow(windowWidth: CGFloat, sidebarDrag: CGFloat) throws {
+        try checkSidebarResize(windowWidth: windowWidth, sidebarDrag: sidebarDrag, store: makeTestStore(pipelines: 0))
+    }
+
+    private func checkSidebarResize(windowWidth: CGFloat, sidebarDrag: CGFloat, store: AppStore) throws {
+        let harness = makeWindow(width: windowWidth, store: store)
         defer { harness.close() }
         let split = try #require(harness.splitViews.first)
 

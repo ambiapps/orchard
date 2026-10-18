@@ -64,6 +64,9 @@ struct ContentView: View {
                 if let runner = selectedRunner {
                     PipelineDetailView(runner: runner)
                         .id(runner.id)
+                } else {
+                    // An empty column ignores its width limits; keep a view here so it doesn't.
+                    Color.clear
                 }
             }
             .navigationSplitViewColumnWidth(min: Layout.activityMin, ideal: Layout.activityIdeal)
