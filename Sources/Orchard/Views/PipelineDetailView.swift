@@ -1,42 +1,40 @@
 import AppKit
 import SwiftUI
 
+/// The detail column: run history and log, plus the pipeline's toolbar.
+/// The settings form is the split view's content column (`PipelineSettingsView`), which
+/// also carries the title, since the content column owns it in a three-column split. Don't nest
+/// an `HSplitView` here instead: the detail column extends under the sidebar, and a nested
+/// split view's minimum width grows with the sidebar until the window overflows.
 struct PipelineDetailView: View {
     @Bindable var runner: PipelineRunner
 
     var body: some View {
-        HSplitView {
-            PipelineSettingsForm(runner: runner)
-                .frame(minWidth: 380, idealWidth: 440)
-            ActivityView(runner: runner)
-                .frame(minWidth: 360)
-        }
-        .navigationTitle(runner.config.name)
-        .navigationSubtitle(runner.status.label)
-        .toolbar {
-            ToolbarItemGroup {
-                if runner.status.isBusy && runner.status != .checking {
-                    Button("Cancel", systemImage: "stop.fill") { runner.cancelRun() }
-                } else {
-                    Button("Build & Deploy Now", systemImage: "hammer") { runner.buildNow() }
-                        .disabled(runner.config.missingSetup != nil || runner.status.isBusy)
+        ActivityView(runner: runner)
+            .toolbar {
+                ToolbarItemGroup {
+                    if runner.status.isBusy && runner.status != .checking {
+                        Button("Cancel", systemImage: "stop.fill") { runner.cancelRun() }
+                    } else {
+                        Button("Build & Deploy Now", systemImage: "hammer") { runner.buildNow() }
+                            .disabled(runner.config.missingSetup != nil || runner.status.isBusy)
+                    }
+                    Toggle(isOn: $runner.config.isEnabled) {
+                        Label(runner.config.isEnabled ? "Enabled" : "Enable",
+                              systemImage: runner.config.isEnabled ? "dot.radiowaves.left.and.right" : "power")
+                    }
+                    .toggleStyle(.button)
+                    .tint(runner.config.isEnabled ? .green : nil)
+                    .disabled(runner.config.missingSetup != nil && !runner.config.isEnabled)
+                    .help(runner.config.missingSetup ?? "Poll the branch and deploy every new commit")
                 }
-                Toggle(isOn: $runner.config.isEnabled) {
-                    Label(runner.config.isEnabled ? "Enabled" : "Enable",
-                          systemImage: runner.config.isEnabled ? "dot.radiowaves.left.and.right" : "power")
-                }
-                .toggleStyle(.button)
-                .tint(runner.config.isEnabled ? .green : nil)
-                .disabled(runner.config.missingSetup != nil && !runner.config.isEnabled)
-                .help(runner.config.missingSetup ?? "Poll the branch and deploy every new commit")
             }
-        }
     }
 }
 
 // MARK: - Settings
 
-private struct PipelineSettingsForm: View {
+struct PipelineSettingsView: View {
     @Bindable var runner: PipelineRunner
     @Environment(AppStore.self) private var store
 
@@ -131,6 +129,8 @@ private struct PipelineSettingsForm: View {
             }
         }
         .formStyle(.grouped)
+        .navigationTitle(runner.config.name)
+        .navigationSubtitle(runner.status.label)
         .task(id: runner.config.repoPath) { await loadRepository() }
         .task(id: [runner.config.repoPath, runner.config.containerPath].compactMap { $0 }) { await loadSchemes() }
     }

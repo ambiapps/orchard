@@ -10,7 +10,7 @@ struct OrchardApp: App {
         Window("Orchard", id: "main") {
             ContentView()
                 .environment(store)
-                .frame(minWidth: 900, minHeight: 600)
+                .frame(minWidth: Layout.windowMinWidth, minHeight: Layout.windowMinHeight)
         }
         .commands {
             CommandGroup(replacing: .newItem) {
