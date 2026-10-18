@@ -8,11 +8,14 @@ final class AppStore {
     private(set) var devices: [DiscoveredDevice] = []
     private(set) var isRefreshingDevices = false
 
+    @ObservationIgnored private let defaults: UserDefaults
     @ObservationIgnored private let defaultsKey = "pipelines"
     @ObservationIgnored private var activity: NSObjectProtocol?
 
-    init() {
-        let configs = UserDefaults.standard.data(forKey: defaultsKey)
+    /// Tests pass their own `defaults` so they never read or overwrite the user's pipelines.
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        let configs = defaults.data(forKey: defaultsKey)
             .flatMap { try? JSONDecoder().decode([PipelineConfig].self, from: $0) } ?? []
         pipelines = configs.map(makeRunner)
         updateActivity()
@@ -60,7 +63,7 @@ final class AppStore {
 
     private func save() {
         let data = try? JSONEncoder().encode(pipelines.map(\.config))
-        UserDefaults.standard.set(data, forKey: defaultsKey)
+        defaults.set(data, forKey: defaultsKey)
     }
 
     /// Keeps App Nap from throttling the poll timers while any pipeline is enabled.

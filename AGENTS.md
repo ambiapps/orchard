@@ -25,8 +25,9 @@ Sources/Orchard/
     DeviceDiscovery.swift     Paired devices (devicectl JSON) and booted simulators (simctl JSON)
     Shell.swift               Async Process wrapper with login-shell PATH and line streaming. All commands go through it
   Views/
-    ContentView.swift         Sidebar of pipelines + detail split view
-    PipelineDetailView.swift  Settings form (repo, branch, container, scheme, configuration, devices, interval)
+    ContentView.swift         Three-column NavigationSplitView (pipelines | settings | activity), Layout widths
+    PipelineDetailView.swift  Settings column (repo, branch, container, scheme, configuration, devices, interval)
+                              and the detail column's toolbar
     ActivityView.swift        Run history and live log
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
 Resources/AppIcon.icon/       Liquid Glass app icon (Icon Composer document: icon.json + SVG layers)
@@ -61,11 +62,13 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Tests
 
-- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
+- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ContentViewLayoutTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
+- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. `makeTestStore()` gives an `AppStore` on throwaway `UserDefaults`; never build one on `.standard` in tests.
+- `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions. The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
 - They use `@testable import Orchard`, so test internal (not `private`) symbols. To test something that's `private`, test it through its public entry point, as `GitTests` does for `parseRefs`, or relax it to internal.
 - `GitTests` runs real `git` against temporary repos (a bare repo stands in as `origin`). Pass identity with `-c user.name=… -c user.email=…`, because CI has no global git config.
 - Anything that needs Xcode signing, `devicectl` or real devices can't run in CI. Keep that logic thin, and pull parsing/decision code out into testable functions.
-- Add tests for new logic in `Core/`. Views aren't unit-tested.
+- Add tests for new logic in `Core/`. Views get layout tests through `WindowHarness` when a bug is about layout; otherwise they aren't unit-tested.
 
 ## Rules and gotchas
 
@@ -73,8 +76,20 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 - **Never touch the user's checkout** beyond `git fetch`. All builds happen in the private worktree.
 - **Run every external command through `Shell`**. It provides the login-shell PATH, cancellation and log streaming. Use absolute paths for system tools (`/usr/bin/git`, `/usr/bin/xcrun`, `/usr/bin/xcodebuild`).
 - **Concurrency:** Swift 6 language mode with strict concurrency. `AppStore` and `PipelineRunner` are `@MainActor @Observable`. Log callbacks are `@Sendable` and may be called off the main actor.
+- **Main window layout:** one three-column `NavigationSplitView`. Don't nest `HSplitView`/`VSplitView` side by side with the sidebar: on macOS 26 the columns extend under the floating sidebar, so a nested split view's minimum width grows with the sidebar until the window overflows. `Layout.windowMinWidth` must fit every column's minimum.
 - **App icon:** edit `Resources/AppIcon.icon` in Icon Composer (or its `icon.json`/SVGs directly). `build-app.sh` passes `actool` absolute paths, because it resolves relative ones in a helper process with a different cwd.
 - Keep `README.md` and the screenshots in `docs/` current when you change behavior or UI. The marketing site is a separate repo, [ambiapps/orchard-web](https://github.com/ambiapps/orchard-web). Update it when you add or change user-facing features.
+
+## Fixing bugs
+
+Work every bug the same way, and do it yourself rather than asking the maintainer to check:
+
+1. **Reproduce it first**, ideally as a failing test. For UI bugs, use `WindowHarness` to recreate the state (for example, drag a split view divider with `setPosition(_:ofDividerAt:)`) and print the frames. Don't run the app against the user's real pipelines: `swift run` keeps its own defaults, but tests must use `makeTestStore()`.
+2. **Find the root cause** before changing code, and fix that, not the symptom.
+3. **Write a regression test** that fails on `main` and passes with the fix. Check it really fails on `main` (for example, in a throwaway `git worktree` of `main` with just the new test copied in).
+4. **Verify the fix** with `swift test`, and for UI changes render before/after screenshots in light and dark mode (`ORCHARD_SCREENSHOTS`), then look at them.
+5. **Update this file** if the bug revealed a rule or gotcha future agents need.
+6. **Open a PR** that explains the root cause, the fix and how it was verified, with the screenshots. Have a separate agent review the PR, address its findings, and only then merge (when the maintainer has asked you to).
 
 ## Workflow
 

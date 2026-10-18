@@ -1,18 +1,16 @@
 import AppKit
 import SwiftUI
 
+/// The detail column: run history and log, plus the pipeline's toolbar.
+/// The settings form is the split view's content column (`PipelineSettingsView`), which
+/// also carries the title, since the content column owns it in a three-column split. Don't nest
+/// an `HSplitView` here instead: the detail column extends under the sidebar, and a nested
+/// split view's minimum width grows with the sidebar until the window overflows.
 struct PipelineDetailView: View {
     @Bindable var runner: PipelineRunner
 
     var body: some View {
-        HSplitView {
-            PipelineSettingsForm(runner: runner)
-                .frame(minWidth: 380, idealWidth: 440)
-            ActivityView(runner: runner)
-                .frame(minWidth: 360)
-        }
-        .navigationTitle(runner.config.name)
-        .navigationSubtitle(runner.status.label)
+        ActivityView(runner: runner)
         .toolbar {
             ToolbarItemGroup {
                 if runner.status.isBusy && runner.status != .checking {
@@ -36,7 +34,7 @@ struct PipelineDetailView: View {
 
 // MARK: - Settings
 
-private struct PipelineSettingsForm: View {
+struct PipelineSettingsView: View {
     @Bindable var runner: PipelineRunner
     @Environment(AppStore.self) private var store
 
@@ -131,6 +129,8 @@ private struct PipelineSettingsForm: View {
             }
         }
         .formStyle(.grouped)
+        .navigationTitle(runner.config.name)
+        .navigationSubtitle(runner.status.label)
         .task(id: runner.config.repoPath) { await loadRepository() }
         .task(id: [runner.config.repoPath, runner.config.containerPath].compactMap { $0 }) { await loadSchemes() }
     }

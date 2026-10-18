@@ -1,5 +1,20 @@
 import SwiftUI
 
+/// Column widths of the main window's three-column split view: pipelines, settings, activity.
+enum Layout {
+    static let sidebarMin: CGFloat = 200
+    static let sidebarIdeal: CGFloat = 240
+    static let sidebarMax: CGFloat = 360
+    static let settingsMin: CGFloat = 340
+    static let settingsIdeal: CGFloat = 440
+    static let activityMin: CGFloat = 360
+    static let activityIdeal: CGFloat = 480
+
+    /// Fits every column at its minimum width, plus room for the dividers.
+    static let windowMinWidth = sidebarMin + settingsMin + activityMin + 20
+    static let windowMinHeight: CGFloat = 600
+}
+
 struct ContentView: View {
     @Environment(AppStore.self) private var store
     @State private var selection: UUID?
@@ -15,7 +30,7 @@ struct ContentView: View {
                         }
                 }
             }
-            .navigationSplitViewColumnWidth(min: 200, ideal: 240)
+            .navigationSplitViewColumnWidth(min: Layout.sidebarMin, ideal: Layout.sidebarIdeal, max: Layout.sidebarMax)
             .toolbar {
                 ToolbarItem {
                     Button("New Pipeline", systemImage: "plus") {
@@ -34,20 +49,35 @@ struct ContentView: View {
                     }
                 }
             }
-        } detail: {
-            if let runner = store.pipelines.first(where: { $0.id == selection }) {
-                PipelineDetailView(runner: runner)
-                    .id(runner.id)
-            } else {
-                ContentUnavailableView("Select a Pipeline", systemImage: "sidebar.left")
+        } content: {
+            Group {
+                if let runner = selectedRunner {
+                    PipelineSettingsView(runner: runner)
+                        .id(runner.id)
+                } else {
+                    ContentUnavailableView("Select a Pipeline", systemImage: "sidebar.left")
+                }
             }
+            .navigationSplitViewColumnWidth(min: Layout.settingsMin, ideal: Layout.settingsIdeal)
+        } detail: {
+            Group {
+                if let runner = selectedRunner {
+                    PipelineDetailView(runner: runner)
+                        .id(runner.id)
+                }
+            }
+            .navigationSplitViewColumnWidth(min: Layout.activityMin, ideal: Layout.activityIdeal)
         }
         .onAppear {
             if selection == nil { selection = store.pipelines.first?.id }
         }
         .onDeleteCommand {
-            if let runner = store.pipelines.first(where: { $0.id == selection }) { delete(runner) }
+            if let runner = selectedRunner { delete(runner) }
         }
+    }
+
+    private var selectedRunner: PipelineRunner? {
+        store.pipelines.first { $0.id == selection }
     }
 
     private func delete(_ runner: PipelineRunner) {
