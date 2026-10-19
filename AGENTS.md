@@ -32,13 +32,14 @@ Sources/Orchard/
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
 Resources/AppIcon.icon/       Liquid Glass app icon (Icon Composer document: icon.json + SVG layers)
 VERSION                       Marketing version (CFBundleShortVersionString); bump it here
-scripts/build-app.sh          Builds build/Orchard.app (release, ad-hoc signed, icon compiled with actool);
-                              --install copies to ~/Applications. BUILD_NUMBER env sets CFBundleVersion (default 1)
-scripts/build-dmg.sh          Builds the app and packages build/Orchard-<version>-<build>.dmg
+scripts/build-app.sh          Builds build/Orchard.app (release, hardened runtime, icon compiled with actool);
+                              --install copies to ~/Applications. BUILD_NUMBER env sets CFBundleVersion (default 1),
+                              SIGN_IDENTITY the codesign identity (default ad-hoc "-")
+scripts/build-dmg.sh          Builds the app and packages build/Orchard-<version>-<build>.dmg (signed too with SIGN_IDENTITY)
 docs/                         README screenshots (light/dark), app-icon/ previews
 .github/workflows/ci.yml      CI: `swift test` + `scripts/build-app.sh` on macos-26
-.github/workflows/release.yml On every push to main: test, build the DMG, publish a GitHub release
-                              tagged v<VERSION>(<run number>), e.g. v1.0.0(42), with the DMG attached
+.github/workflows/release.yml On every push to main: test, build a Developer ID signed DMG, notarize and staple it,
+                              publish a GitHub release tagged v<VERSION>(<run number>), e.g. v1.0.0(42), with the DMG
 ```
 
 ## How a run works
@@ -77,6 +78,8 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 - **Run every external command through `Shell`**. It provides the login-shell PATH, cancellation and log streaming. Use absolute paths for system tools (`/usr/bin/git`, `/usr/bin/xcrun`, `/usr/bin/xcodebuild`).
 - **Concurrency:** Swift 6 language mode with strict concurrency. `AppStore` and `PipelineRunner` are `@MainActor @Observable`. Log callbacks are `@Sendable` and may be called off the main actor.
 - **Main window layout:** one three-column `NavigationSplitView`. Don't nest an `HSplitView` in a column: on macOS 26 the columns extend under the floating sidebar, so a nested horizontal split view's minimum width grows with the sidebar until the window overflows. A `VSplitView` (as in `ActivityView`) is fine. `Layout.windowMinWidth` must fit every column's minimum.
+- **Release signing secrets** live in the `release` GitHub environment (main only): `DEVELOPER_ID_P12_BASE64`, `DEVELOPER_ID_P12_PASSWORD`, `NOTARY_KEY_P8_BASE64`, `NOTARY_KEY_ID`, `NOTARY_ISSUER_ID`. The repo is public, so keep them out of reach of untrusted code: only the `release` job may use the environment, pass each secret only to the step that needs it, never run tests in that job, never print or `set -x` around them, pin actions to commit SHAs, and never add `pull_request_target` or `workflow_run` to `release.yml`.
+- **Hardened runtime:** every build is signed with it, because notarization requires it. If a feature needs an exception (Apple Events, JIT, loading unsigned libraries), add an entitlements file and pass it in `build-app.sh`.
 - **App icon:** edit `Resources/AppIcon.icon` in Icon Composer (or its `icon.json`/SVGs directly). `build-app.sh` passes `actool` absolute paths, because it resolves relative ones in a helper process with a different cwd.
 - Keep `README.md` and the screenshots in `docs/` current when you change behavior or UI. The marketing site is a separate repo, [ambiapps/orchard-web](https://github.com/ambiapps/orchard-web). Update it when you add or change user-facing features.
 

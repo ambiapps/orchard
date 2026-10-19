@@ -16,7 +16,7 @@ Run the tests with `swift test`. CI runs them, plus the app bundle build, on eve
 
 ## Releases
 
-Every push to `main` builds a DMG (`./scripts/build-dmg.sh`) and publishes it as a [GitHub release](https://github.com/ambiapps/orchard/releases) tagged `v<version>(<build>)`, e.g. `v1.0.0(42)`. The version comes from [`VERSION`](VERSION); the build number is the CI run number. The app is ad-hoc signed, not notarized, so after the first launch attempt allow it in **System Settings › Privacy & Security › Open Anyway** (or run `xattr -dr com.apple.quarantine /Applications/Orchard.app`).
+Every push to `main` builds a DMG (`./scripts/build-dmg.sh`) and publishes it as a [GitHub release](https://github.com/ambiapps/orchard/releases) tagged `v<version>(<build>)`, e.g. `v1.0.0(42)`. The version comes from [`VERSION`](VERSION); the build number is the CI run number. Release builds are signed with a Developer ID certificate and notarized by Apple, so they open without Gatekeeper warnings. Local builds from `./scripts/build-app.sh` are ad-hoc signed.
 
 ## Using it
 

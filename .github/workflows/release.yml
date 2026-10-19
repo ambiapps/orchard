@@ -1,33 +1,74 @@
 name: Release
 
-# Every push to main (i.e. every merged PR) builds a DMG and publishes it as a
-# GitHub release tagged v<VERSION>(<run number>), e.g. v1.0.0(42).
+# Every push to main (i.e. every merged PR) builds a Developer ID signed, notarized DMG and publishes it
+# as a GitHub release tagged v<VERSION>(<run number>), e.g. v1.0.0(42).
+#
+# Signing secrets live in the `release` environment, which only main may deploy to. Only the release job
+# can read them, and each secret is passed only to the step that needs it. Tests run in a separate job
+# without secrets. Never add pull_request_target or workflow_run triggers to this workflow.
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
-  release:
+  test:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       - name: Test
         run: swift test
 
-      - name: Build DMG
+  release:
+    needs: test
+    runs-on: macos-26
+    timeout-minutes: 45
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Import Developer ID certificate
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          if [[ -z "$DEVELOPER_ID_P12_BASE64" || -z "$DEVELOPER_ID_P12_PASSWORD" ]]; then
+            echo "::error::DEVELOPER_ID_P12_BASE64 and DEVELOPER_ID_P12_PASSWORD must be set in the release environment"
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          base64 --decode <<< "$DEVELOPER_ID_P12_BASE64" > "$RUNNER_TEMP/developer-id.p12"
+          # -x: the private key can't be exported from the keychain again.
+          security import "$RUNNER_TEMP/developer-id.p12" -k "$KEYCHAIN" -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign -x
+          rm -f "$RUNNER_TEMP/developer-id.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          KEYCHAINS=("$KEYCHAIN")
+          while IFS= read -r existing; do KEYCHAINS+=("$(xargs <<< "$existing")"); done \
+            < <(security list-keychains -d user)
+          security list-keychains -d user -s "${KEYCHAINS[@]}"
+
+      - name: Build signed DMG
         id: build
         env:
           BUILD_NUMBER: ${{ github.run_number }}
+          SIGN_IDENTITY: Developer ID Application
         run: |
           VERSION="$(tr -d '[:space:]' < VERSION)"
           DMG="$(./scripts/build-dmg.sh | tail -n 1)"
@@ -35,6 +76,36 @@ jobs:
             echo "tag=v$VERSION($BUILD_NUMBER)"
             echo "dmg=$DMG"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Notarize and staple
+        env:
+          DMG: ${{ steps.build.outputs.dmg }}
+          NOTARY_KEY_P8_BASE64: ${{ secrets.NOTARY_KEY_P8_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          if [[ -z "$NOTARY_KEY_P8_BASE64" || -z "$NOTARY_KEY_ID" || -z "$NOTARY_ISSUER_ID" ]]; then
+            echo "::error::NOTARY_KEY_P8_BASE64, NOTARY_KEY_ID and NOTARY_ISSUER_ID must be set in the release environment"
+            exit 1
+          fi
+          KEY="$RUNNER_TEMP/notary-key.p8"
+          base64 --decode <<< "$NOTARY_KEY_P8_BASE64" > "$KEY"
+          AUTH=(--key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
+          RESULT="$RUNNER_TEMP/notary-result.json"
+          xcrun notarytool submit "$DMG" "${AUTH[@]}" --wait --timeout 30m --output-format json > "$RESULT" || true
+          STATUS="$(plutil -extract status raw -o - "$RESULT" 2>/dev/null || echo unknown)"
+          if [[ "$STATUS" != "Accepted" ]]; then
+            cat "$RESULT"
+            ID="$(plutil -extract id raw -o - "$RESULT" 2>/dev/null || true)"
+            if [[ -n "$ID" ]]; then xcrun notarytool log "$ID" "${AUTH[@]}"; fi
+            rm -f "$KEY"
+            echo "::error::Notarization status: $STATUS"
+            exit 1
+          fi
+          rm -f "$KEY"
+          xcrun stapler staple "$DMG"
+          xcrun stapler validate "$DMG"
+          spctl --assess --type open --context context:primary-signature --verbose "$DMG"
 
       - name: Create release
         env:
@@ -46,3 +117,9 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Orchard $TAG" \
             --generate-notes
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"

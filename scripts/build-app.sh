@@ -1,12 +1,14 @@
 #!/bin/bash
 # Builds Orchard.app into ./build. Pass --install to copy it to ~/Applications and open it.
 # The version comes from ./VERSION; set BUILD_NUMBER to stamp CFBundleVersion (CI uses the run number).
+# SIGN_IDENTITY picks the codesign identity: ad-hoc ("-") by default, "Developer ID Application" for releases.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 APP="build/Orchard.app"
 VERSION="$(tr -d '[:space:]' < VERSION)"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 swift build -c release
 BIN="$(swift build -c release --show-bin-path)/Orchard"
@@ -45,7 +47,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --sign - "$APP"
+# Always sign with the hardened runtime (notarization requires it), so local and CI builds behave like releases.
+# A secure timestamp needs a real identity, so ad-hoc builds skip it.
+SIGN_ARGS=(--force --options runtime --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_IDENTITY" != "-" ]]; then SIGN_ARGS+=(--timestamp); fi
+codesign "${SIGN_ARGS[@]}" "$APP"
 echo "Built $APP ($VERSION, build $BUILD_NUMBER)"
 
 if [[ "${1:-}" == "--install" ]]; then
