@@ -31,7 +31,7 @@ Sources/Orchard/
     ActivityView.swift        Run history and live log
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
 Resources/AppIcon.icon/       Liquid Glass app icon (Icon Composer document: icon.json + SVG layers)
-VERSION                       Marketing version (CFBundleShortVersionString); bump it here
+VERSION                       Marketing version (CFBundleShortVersionString); every PR bumps its patch digit
 scripts/build-app.sh          Builds build/Orchard.app (release, ad-hoc signed, icon compiled with actool);
                               --install copies to ~/Applications. BUILD_NUMBER env sets CFBundleVersion (default 1)
 scripts/build-dmg.sh          Builds the app and packages build/Orchard-<version>-<build>.dmg
@@ -96,4 +96,5 @@ Work every bug the same way, and do it yourself rather than asking the maintaine
 - `main` is protected. Changes land only through PRs, the `Build & test` check must pass, and only the maintainer (@JagCesar) can merge. Don't try to push to `main`.
 - Work on a branch, keep each PR to one topic, and run `swift test` before pushing.
 - Never rebase or squash. To catch up with `main`, merge `main` into your branch. PRs are merged with merge commits.
+- **Bump the patch version in every PR.** Each merge to `main` publishes a release, so every PR increments the last digit of `VERSION` (e.g. `1.0.1` → `1.0.2`); the build number in parentheses comes from CI on its own. Bump minor or major only if the maintainer asks. If `main`'s `VERSION` moved while your PR was open, merge `main` and bump again from its value, so two releases never share a version.
 - For UI changes, put screenshots in the PR description: before/after for changed screens, in both light and dark mode. Orchard is macOS-only.
