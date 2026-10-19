@@ -37,6 +37,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       - name: Import Developer ID certificate
         env:
@@ -71,7 +73,9 @@ jobs:
           SIGN_IDENTITY: Developer ID Application
         run: |
           VERSION="$(tr -d '[:space:]' < VERSION)"
-          DMG="$(./scripts/build-dmg.sh | tail -n 1)"
+          DMG="build/Orchard-$VERSION-$BUILD_NUMBER.dmg"
+          ./scripts/build-dmg.sh
+          test -f "$DMG"
           {
             echo "tag=v$VERSION($BUILD_NUMBER)"
             echo "dmg=$DMG"
@@ -97,7 +101,7 @@ jobs:
           if [[ "$STATUS" != "Accepted" ]]; then
             cat "$RESULT"
             ID="$(plutil -extract id raw -o - "$RESULT" 2>/dev/null || true)"
-            if [[ -n "$ID" ]]; then xcrun notarytool log "$ID" "${AUTH[@]}"; fi
+            if [[ -n "$ID" ]]; then xcrun notarytool log "$ID" "${AUTH[@]}" || true; fi
             rm -f "$KEY"
             echo "::error::Notarization status: $STATUS"
             exit 1
