@@ -14,7 +14,7 @@ struct GitTests {
         let feature = try await commit("Second", in: clone.url)
         try await git(["push", "origin", "HEAD:refs/heads/feature/x"], in: clone.url)
 
-        #expect(await Git.remote(in: clone.url) == "origin")
+        #expect(try await Git.remote(in: clone.url) == "origin")
         #expect(try await Git.branches(in: clone.url) == ["feature/x", "main"])
         #expect(try await Git.headCommit(of: "main", in: clone.url) == main)
         #expect(try await Git.headCommit(of: "feature/x", in: clone.url) == feature)
@@ -30,10 +30,27 @@ struct GitTests {
         let head = try await commit("Only", in: repo.url)
         try await git(["branch", "topic"], in: repo.url)
 
-        #expect(await Git.remote(in: repo.url) == nil)
+        #expect(try await Git.remote(in: repo.url) == nil)
         #expect(await Git.isRepository(repo.url))
         #expect(try await Git.branches(in: repo.url) == ["main", "topic"])
         #expect(try await Git.headCommit(of: "topic", in: repo.url) == head)
+    }
+
+    @Test func remoteThrowsInsteadOfClaimingLocalOnly() async throws {
+        let notARepo = try TemporaryDirectory()
+        await #expect(throws: ShellError.self) {
+            try await Git.remote(in: notARepo.url)
+        }
+    }
+
+    @Test func acceptsOnlyFullCommitHashes() throws {
+        let sha1 = String(repeating: "a1", count: 20)
+        let sha256 = String(repeating: "b2", count: 32)
+        #expect(try Git.commitSHA(sha1 + "\n") == sha1)
+        #expect(try Git.commitSHA(sha256) == sha256)
+        for output in ["", "\n", "8ab7f1a2", "fatal: not a git repository", String(repeating: "g", count: 40)] {
+            #expect(throws: GitError.self) { try Git.commitSHA(output) }
+        }
     }
 
     @Test func preparesAndReusesWorktree() async throws {

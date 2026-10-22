@@ -61,18 +61,23 @@ enum Shell {
                 process.standardError = pipe
                 process.standardInput = FileHandle.nullDevice
 
+                do {
+                    try process.run()
+                    box.set(process)
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                // One reader drains the pipe to EOF before the exit status is read. Mixing a
+                // readabilityHandler with a terminationHandler could drop output still in flight.
                 let collector = OutputCollector(onLine: onLine)
-                pipe.fileHandleForReading.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        handle.readabilityHandler = nil
-                    } else {
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let handle = pipe.fileHandleForReading
+                    while case let data = handle.availableData, !data.isEmpty {
                         collector.append(data)
                     }
-                }
-                process.terminationHandler = { process in
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    collector.append(pipe.fileHandleForReading.readDataToEndOfFile())
+                    process.waitUntilExit()
                     let output = collector.finish()
                     if box.cancelled {
                         continuation.resume(throwing: CancellationError())
@@ -82,12 +87,6 @@ enum Shell {
                         continuation.resume(throwing: ShellError(
                             command: commandLine, status: process.terminationStatus, output: output))
                     }
-                }
-                do {
-                    try process.run()
-                    box.set(process)
-                } catch {
-                    continuation.resume(throwing: error)
                 }
             }
         } onCancel: {
