@@ -61,6 +61,11 @@ enum Shell {
                 process.standardError = pipe
                 process.standardInput = FileHandle.nullDevice
 
+                // Set before run() so the exit can't be missed. waitUntilExit() isn't used: it spins
+                // the calling thread's run loop and can sleep forever after the process has exited.
+                let exited = DispatchSemaphore(value: 0)
+                process.terminationHandler = { _ in exited.signal() }
+
                 do {
                     try process.run()
                     box.set(process)
@@ -71,13 +76,15 @@ enum Shell {
 
                 // One reader drains the pipe to EOF before the exit status is read. Mixing a
                 // readabilityHandler with a terminationHandler could drop output still in flight.
+                // It gets its own thread because it blocks for the command's whole lifetime, which
+                // would tie up a worker in GCD's limited pool.
                 let collector = OutputCollector(onLine: onLine)
-                DispatchQueue.global(qos: .userInitiated).async {
+                Thread.detachNewThread {
                     let handle = pipe.fileHandleForReading
                     while case let data = handle.availableData, !data.isEmpty {
                         collector.append(data)
                     }
-                    process.waitUntilExit()
+                    exited.wait()
                     let output = collector.finish()
                     if box.cancelled {
                         continuation.resume(throwing: CancellationError())
