@@ -61,18 +61,30 @@ enum Shell {
                 process.standardError = pipe
                 process.standardInput = FileHandle.nullDevice
 
+                // Set before run() so the exit can't be missed. waitUntilExit() isn't used: it spins
+                // the calling thread's run loop and can sleep forever after the process has exited.
+                let exited = DispatchSemaphore(value: 0)
+                process.terminationHandler = { _ in exited.signal() }
+
+                do {
+                    try process.run()
+                    box.set(process)
+                } catch {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                // One reader drains the pipe to EOF before the exit status is read. Mixing a
+                // readabilityHandler with a terminationHandler could drop output still in flight.
+                // It gets its own thread because it blocks for the command's whole lifetime, which
+                // would tie up a worker in GCD's limited pool.
                 let collector = OutputCollector(onLine: onLine)
-                pipe.fileHandleForReading.readabilityHandler = { handle in
-                    let data = handle.availableData
-                    if data.isEmpty {
-                        handle.readabilityHandler = nil
-                    } else {
+                Thread.detachNewThread {
+                    let handle = pipe.fileHandleForReading
+                    while case let data = handle.availableData, !data.isEmpty {
                         collector.append(data)
                     }
-                }
-                process.terminationHandler = { process in
-                    pipe.fileHandleForReading.readabilityHandler = nil
-                    collector.append(pipe.fileHandleForReading.readDataToEndOfFile())
+                    exited.wait()
                     let output = collector.finish()
                     if box.cancelled {
                         continuation.resume(throwing: CancellationError())
@@ -82,12 +94,6 @@ enum Shell {
                         continuation.resume(throwing: ShellError(
                             command: commandLine, status: process.terminationStatus, output: output))
                     }
-                }
-                do {
-                    try process.run()
-                    box.set(process)
-                } catch {
-                    continuation.resume(throwing: error)
                 }
             }
         } onCancel: {

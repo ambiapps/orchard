@@ -2,14 +2,16 @@ import Foundation
 
 enum Git {
     /// `origin` if the repo has it, otherwise its first remote, otherwise nil (local-only repo).
-    static func remote(in repo: URL) async -> String? {
-        guard let output = try? await Shell.git(["remote"], in: repo) else { return nil }
+    /// Throws when `git remote` fails, so a failure can't pass for a local-only repo and make
+    /// callers read the user's possibly stale local branches instead of the remote's.
+    static func remote(in repo: URL) async throws -> String? {
+        let output = try await Shell.git(["remote"], in: repo)
         let remotes = output.split(separator: "\n").map(String.init)
         return remotes.contains("origin") ? "origin" : remotes.first
     }
 
     static func remoteURL(in repo: URL) async -> String? {
-        guard let remote = await remote(in: repo) else { return nil }
+        guard let remote = try? await remote(in: repo) else { return nil }
         return try? await Shell.git(["remote", "get-url", remote], in: repo)
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -25,7 +27,7 @@ enum Git {
 
     /// Branches on the remote (or local branches for a repo without remotes).
     static func branches(in repo: URL) async throws -> [String] {
-        if let remote = await remote(in: repo) {
+        if let remote = try await remote(in: repo) {
             let output = try await Shell.git(["ls-remote", "--heads", remote], in: repo)
             return parseRefs(output).keys.sorted()
         }
@@ -34,16 +36,25 @@ enum Git {
     }
 
     /// Current head commit of the branch, asking the remote directly so nothing local changes.
+    /// Throws unless the answer is a full commit SHA.
     static func headCommit(of branch: String, in repo: URL) async throws -> String {
-        if let remote = await remote(in: repo) {
+        if let remote = try await remote(in: repo) {
             let output = try await Shell.git(["ls-remote", "--heads", remote, "refs/heads/\(branch)"], in: repo)
             guard let sha = parseRefs(output)[branch] else {
                 throw GitError.branchNotFound(branch)
             }
-            return sha
+            return try commitSHA(sha)
         }
-        return try await Shell.git(["rev-parse", "refs/heads/\(branch)"], in: repo)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return try commitSHA(try await Shell.git(["rev-parse", "refs/heads/\(branch)"], in: repo))
+    }
+
+    /// `output` trimmed, if it is a full SHA-1 or SHA-256 commit hash.
+    static func commitSHA(_ output: String) throws -> String {
+        let sha = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard [40, 64].contains(sha.count), sha.allSatisfy(\.isHexDigit) else {
+            throw GitError.invalidCommit(sha)
+        }
+        return sha
     }
 
     /// Fetches `commit` and checks it out in Orchard's private worktree for this pipeline.
@@ -52,7 +63,7 @@ enum Git {
         at worktree: URL, repo: URL, branch: String, commit: String,
         log: @escaping @Sendable (String) -> Void
     ) async throws {
-        if let remote = await remote(in: repo) {
+        if let remote = try await remote(in: repo) {
             try await Shell.git(["fetch", "--no-tags", remote, "refs/heads/\(branch)"], in: repo, onLine: log)
         }
         let fm = FileManager.default
@@ -95,10 +106,12 @@ enum Git {
 
 enum GitError: LocalizedError {
     case branchNotFound(String)
+    case invalidCommit(String)
 
     var errorDescription: String? {
         switch self {
         case .branchNotFound(let branch): "Branch “\(branch)” no longer exists on the remote."
+        case .invalidCommit(let output): "Git returned “\(output)” instead of a commit hash."
         }
     }
 }
