@@ -233,6 +233,7 @@ final class PipelineRunner: Identifiable {
                 try Task.checkCancellation()
 
                 status = .building(platform)
+                runs.forgetProducts(keeping: record.id)
                 append(.step, "Building \(scheme) (\(config.configuration)) for \(platform.displayName)")
                 let buildStart = Date()
                 let product: BuiltProduct
@@ -258,31 +259,17 @@ final class PipelineRunner: Identifiable {
                     continue
                 }
                 append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
+                update { $0.products = ($0.products ?? [:]).merging([platform.rawValue: product]) { $1 } }
 
                 for device in devices {
                     try Task.checkCancellation()
-                    status = .deploying(device.name)
-                    update { $0.deviceOutcomes[device.id] = .running }
-                    append(.step, "Deploying to \(device.name)")
                     let deployStart = Date()
                     defer {
                         timings.deploy += Date().timeIntervalSince(deployStart)
                         update { $0.timings = timings }
                     }
-                    do {
-                        try await Deployer.deploy(product, to: device, log: raw)
-                        update { $0.deviceOutcomes[device.id] = .succeeded }
-                        append(.success, "Launched on \(device.name) in \(Date().timeIntervalSince(deployStart).formattedDuration)")
-                    } catch is CancellationError {
-                        throw CancellationError()
-                    } catch let error as DeployError {
-                        update { $0.deviceOutcomes[device.id] = .warning(error.localizedDescription) }
-                        append(.warning, "\(device.name): \(error.localizedDescription) (\(Date().timeIntervalSince(deployStart).formattedDuration))")
-                    } catch {
-                        let message = (error as? ShellError).map { lastMeaningfulLine($0.output) }
-                            ?? error.localizedDescription
-                        update { $0.deviceOutcomes[device.id] = .failed(message) }
-                        append(.error, "\(device.name): \(message) (\(Date().timeIntervalSince(deployStart).formattedDuration))")
+                    try await deploy(product, to: device, log: raw) { outcome in
+                        update { $0.deviceOutcomes[device.id] = outcome }
                     }
                 }
             }
@@ -309,7 +296,10 @@ final class PipelineRunner: Identifiable {
                               body: "\(commit.shortSHA) is running on \(config.devices.count) device(s).")
             }
         } catch is CancellationError {
-            update { $0.outcome = .failed("Cancelled") }
+            update {
+                $0.outcome = .failed("Cancelled")
+                $0.markUnfinishedDevices(.failed("Cancelled"))
+            }
             append(.warning, "Cancelled after \(Date().timeIntervalSince(runStart).formattedDuration)")
         } catch {
             update { $0.outcome = .failed(error.localizedDescription) }
@@ -318,6 +308,82 @@ final class PipelineRunner: Identifiable {
         }
         update { $0.finishedAt = Date() }
         logFile.close()
+    }
+
+    /// Deploys a device again from a run's build, if that build is still in DerivedData.
+    func canRedeploy(_ device: Device, from run: RunRecord) -> Bool {
+        guard !status.isBusy, run.deviceOutcomes[device.id]?.canRetry == true,
+              let product = run.product(for: device.platform) else { return false }
+        return FileManager.default.fileExists(atPath: product.appURL.path)
+    }
+
+    /// Installs and launches `run`'s build on `device` again, e.g. after it failed because the
+    /// device was locked or disconnected. Doesn't build anything.
+    func redeploy(_ device: Device, from runID: RunRecord.ID) {
+        guard runTask == nil, let run = runs.first(where: { $0.id == runID }),
+              canRedeploy(device, from: run), let product = run.product(for: device.platform) else { return }
+        runTask = Task {
+            await redeploy(product, to: device, run: run)
+            runTask = nil
+        }
+    }
+
+    private func redeploy(_ product: BuiltProduct, to device: Device, run: RunRecord) async {
+        defer { status = config.isEnabled ? .idle : .disabled }
+        func update(_ change: (inout RunRecord) -> Void) {
+            guard let index = runs.firstIndex(where: { $0.id == run.id }) else { return }
+            change(&runs[index])
+        }
+        let logFile = run.logFile.flatMap(LogFile.init(appendingTo:))
+        defer { logFile?.close() }
+        let raw: @Sendable (String) -> Void
+        if let logFile { raw = logger(file: logFile, condensed: false) } else { raw = { _ in } }
+        append(.step, "Deploying \(run.commit.shortSHA) to \(device.name) again")
+        do {
+            try await deploy(product, to: device, log: raw, announce: false) { outcome in
+                update { $0.deviceOutcomes[device.id] = outcome }
+            }
+        } catch {
+            // Nothing changed on the device that matters; keep what the run recorded.
+            update { $0.deviceOutcomes[device.id] = run.deviceOutcomes[device.id] }
+            append(.warning, "Cancelled")
+            return
+        }
+        guard let updated = runs.first(where: { $0.id == run.id }), updated.finishedAt != nil else { return }
+        let devices = config.devices.filter { updated.deviceOutcomes[$0.id] != nil }
+        let outcome = updated.finalOutcome(devices: devices)
+        update { $0.outcome = outcome }
+        // The newest attempt is now installed on every device, so it counts as deployed.
+        let failed = if case .failed = outcome { true } else { false }
+        if !failed, runs.first?.id == run.id, run.commit == config.lastAttemptedCommit {
+            config.lastDeployedCommit = run.commit
+            config.lastDeployedAt = Date()
+        }
+    }
+
+    /// Installs and launches `product` on `device`, reporting its outcome as it goes.
+    /// Throws only `CancellationError`; a failed deploy is an outcome.
+    private func deploy(_ product: BuiltProduct, to device: Device, log: @escaping @Sendable (String) -> Void,
+                        announce: Bool = true, outcome report: (DeployOutcome) -> Void) async throws {
+        status = .deploying(device.name)
+        report(.running)
+        if announce { append(.step, "Deploying to \(device.name)") }
+        let start = Date()
+        do {
+            try await Deployer.deploy(product, to: device, log: log)
+            report(.succeeded)
+            append(.success, "Launched on \(device.name) in \(Date().timeIntervalSince(start).formattedDuration)")
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as DeployError {
+            report(.warning(error.localizedDescription))
+            append(.warning, "\(device.name): \(error.localizedDescription) (\(Date().timeIntervalSince(start).formattedDuration))")
+        } catch {
+            let message = (error as? ShellError).map { lastMeaningfulLine($0.output) }
+                ?? error.localizedDescription
+            report(.failed(message))
+            append(.error, "\(device.name): \(message) (\(Date().timeIntervalSince(start).formattedDuration))")
+        }
     }
 
     /// Removes Orchard's checkout and build products for this pipeline.
@@ -406,6 +472,14 @@ final class LogFile: @unchecked Sendable {
         url = dir.appendingPathComponent("\(formatter.string(from: Date()))_\(commit.shortSHA).log")
         FileManager.default.createFile(atPath: url.path, contents: nil)
         handle = try? FileHandle(forWritingTo: url)
+    }
+
+    /// Appends to an existing run log, for deploying that run again.
+    init?(appendingTo url: URL) {
+        guard let handle = try? FileHandle(forWritingTo: url) else { return nil }
+        _ = try? handle.seekToEnd()
+        self.url = url
+        self.handle = handle
     }
 
     func write(_ line: String) {

@@ -44,15 +44,22 @@ enum DeviceDiscovery {
         return [DiscoveredDevice(device: .thisMac, isConnected: true)] + rows + simulators
     }
 
-    /// Rows for the device list: discovered devices plus selected ones that weren't discovered,
-    /// connected/available ones first. Stable, so each group keeps its order (this Mac, physical
-    /// devices, simulators, then the missing selected devices).
+    /// Rows for the device list: discovered devices plus selected ones that weren't discovered.
+    /// Enabled (selected) devices come first, then the rest; within each, connected/available ones
+    /// come first. Stable, so each group keeps its order (this Mac, physical devices, simulators,
+    /// then the missing selected devices).
     static func listRows(discovered: [DiscoveredDevice], selected: [Device]) -> [DiscoveredDevice] {
         let missing = selected
             .filter { device in !discovered.contains { $0.id == device.id } }
             .map { DiscoveredDevice(device: $0, isConnected: false) }
         let all = discovered + missing
-        return all.filter(\.isConnected) + all.filter { !$0.isConnected }
+        let selectedIDs = Set(selected.map(\.id))
+        func rank(_ row: DiscoveredDevice) -> Int {
+            (selectedIDs.contains(row.id) ? 0 : 2) + (row.isConnected ? 0 : 1)
+        }
+        return all.enumerated()
+            .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
+            .map(\.element)
     }
 
     private static func physicalDevices() async -> [PhysicalDevice]? {

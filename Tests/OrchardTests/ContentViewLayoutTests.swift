@@ -118,7 +118,32 @@ struct ContentViewLayoutTests {
             }
             harness.settle()
             try harness.snapshot(to: directory.appendingPathComponent("deploys-expanded-\(name).png"))
+
+            try redeploySnapshot(appearance: appearance, to: directory.appendingPathComponent("redeploy-\(name).png"))
         }
+    }
+
+    /// A deploy that failed on one of two devices, whose build can be deployed to it again.
+    private func redeploySnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+        let dir = try TemporaryDirectory()
+        try dir.makeDirectories("App.app")
+        let phone = Device(id: "iphone", name: "iPhone", model: "iPhone 17 Pro", kind: .physical,
+                           platform: .iOS, osVersion: "26.0")
+        let pad = Device(id: "ipad", name: "iPad Pro", model: "iPad Pro", kind: .physical,
+                         platform: .iOS, osVersion: "26.0")
+        let store = makeTestStore()
+        let runner = store.pipelines[0]
+        runner.config.devices = [phone, pad]
+        var runs = sampleRuns(device: phone.id)
+        runs[0].outcome = .failed("1 of 2 device(s) failed")
+        runs[0].deviceOutcomes = [phone.id: .failed("The device is not connected."), pad.id: .succeeded]
+        runs[0].products = [BuildPlatform.iOS.rawValue: BuiltProduct(
+            appURL: dir.url.appendingPathComponent("App.app"), bundleIdentifier: "com.example.app")]
+        runner.runs = runs
+        let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
     }
 
     /// The settings column with a mix of connected, disconnected and booted simulator devices.
@@ -141,7 +166,7 @@ struct ContentViewLayoutTests {
             DiscoveredDevice(device: simulator, isConnected: true),
         ])
         let runner = store.addPipeline()
-        runner.config.devices = [iPhone, oldPhone]
+        runner.config.devices = [iPhone, simulator, oldPhone]
         let harness = makeWindow(width: 1100, appearance: appearance, store: store)
         defer { harness.close() }
         harness.window.title = runner.config.name

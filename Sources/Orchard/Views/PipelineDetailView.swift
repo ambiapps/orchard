@@ -255,7 +255,7 @@ private struct DevicesSection: View {
         }
     }
 
-    /// Discovered devices, plus selected ones that aren't currently visible, available ones first.
+    /// Discovered devices, plus selected ones that aren't currently visible: enabled ones first, then available ones.
     private var rows: [DiscoveredDevice] {
         DeviceDiscovery.listRows(discovered: store.devices, selected: runner.config.devices)
     }

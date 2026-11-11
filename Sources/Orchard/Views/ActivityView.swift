@@ -27,7 +27,7 @@ private struct RunsList: View {
                 }
                 ForEach(runner.runs) { run in
                     let isExpanded = expanded.contains(run.id)
-                    RunRow(run: run, devices: runner.config.devices, isExpanded: isExpanded) {
+                    RunRow(runner: runner, run: run, isExpanded: isExpanded) {
                         if isExpanded { expanded.remove(run.id) } else { expanded.insert(run.id) }
                     }
                     .listRowSeparator(isExpanded ? .hidden : .automatic, edges: .bottom)
@@ -45,8 +45,8 @@ private struct RunsList: View {
 }
 
 private struct RunRow: View {
+    let runner: PipelineRunner
     let run: RunRecord
-    let devices: [Device]
     let isExpanded: Bool
     let toggleChanges: () -> Void
 
@@ -79,14 +79,11 @@ private struct RunRow: View {
                 }
             }
             HStack(spacing: 10) {
-                ForEach(devices.filter { run.deviceOutcomes[$0.id] != nil }) { device in
-                    let outcome = run.deviceOutcomes[device.id] ?? .pending
-                    Label {
-                        Text(device.name).font(.caption)
-                    } icon: {
-                        OutcomeIcon(outcome: outcome).imageScale(.small)
+                ForEach(runner.config.devices.filter { run.deviceOutcomes[$0.id] != nil }) { device in
+                    DeviceOutcomeLabel(device: device, outcome: run.deviceOutcomes[device.id] ?? .pending,
+                                       canRedeploy: runner.canRedeploy(device, from: run)) {
+                        runner.redeploy(device, from: run.id)
                     }
-                    .help(outcome.message ?? device.name)
                 }
                 if let phases = run.timings?.phases, !phases.isEmpty {
                     Spacer()
@@ -118,6 +115,41 @@ private struct RunRow: View {
     private func changesLabel(_ changes: [CommitSummary], base: String) -> String {
         let count = changes.count > Git.changesLimit ? "\(Git.changesLimit)+" : "\(changes.count)"
         return "\(count) \(changes.count == 1 ? "commit" : "commits") since \(base.shortSHA)"
+    }
+}
+
+/// A device's outcome in a deploy. A device that failed is a button that deploys the same build
+/// to it again, while that build is still around.
+private struct DeviceOutcomeLabel: View {
+    let device: Device
+    let outcome: DeployOutcome
+    let canRedeploy: Bool
+    let redeploy: () -> Void
+
+    var body: some View {
+        if canRedeploy {
+            Button(action: redeploy) {
+                Label {
+                    HStack(spacing: 3) {
+                        Text(device.name)
+                        Image(systemName: "arrow.clockwise").foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    OutcomeIcon(outcome: outcome).imageScale(.small)
+                }
+                .contentShape(.rect)
+            }
+            .buttonStyle(.plain)
+            .font(.caption)
+            .help("\(outcome.message.map { "\($0)\n" } ?? "")Click to deploy this build to \(device.name) again")
+        } else {
+            Label {
+                Text(device.name).font(.caption)
+            } icon: {
+                OutcomeIcon(outcome: outcome).imageScale(.small)
+            }
+            .help(outcome.message ?? device.name)
+        }
     }
 }
 

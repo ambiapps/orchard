@@ -1,6 +1,6 @@
 import Foundation
 
-struct BuiltProduct: Sendable {
+struct BuiltProduct: Hashable, Sendable, Codable {
     var appURL: URL
     var bundleIdentifier: String
 }
