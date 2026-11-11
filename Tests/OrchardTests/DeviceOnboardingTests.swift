@@ -177,6 +177,10 @@ struct DeviceOnboardingTests {
         await store.onboardingSettled()
         #expect(store.onboarding["phone"] == .failed("ERROR: The developer disk image could not be mounted"))
         #expect(runner.config.devices.isEmpty)
+        // The retry keeps the reason on the row rather than flipping back to "Preparing…".
+        store.onboard([phone(.paired, developerMode: true)])
+        #expect(store.onboarding["phone"] == .failed("ERROR: The developer disk image could not be mounted"))
+        await store.onboardingSettled()
 
         calls.fail(with: nil)
         store.onboard([phone(.paired, developerMode: true)])
@@ -226,6 +230,11 @@ struct DeviceOnboardingTests {
             store.onboard([phone(.unpaired, wired: true)])
             await store.onboardingSettled()
         }
+        calls.fail(with: "ERROR: mount failed")
+        for _ in 0..<3 {
+            store.onboard([phone(.paired, wired: false, developerMode: true)])
+            await store.onboardingSettled()
+        }
         calls.fail(with: nil)
         store.onboard([phone(.paired, wired: false, developerMode: true)])
         await store.onboardingSettled()
@@ -236,6 +245,8 @@ struct DeviceOnboardingTests {
         #expect(text.contains("Unlock it and tap Trust"))
         // The same failure on every poll isn't repeated.
         #expect(text.components(separatedBy: "The device is locked").count == 2)
+        #expect(text.components(separatedBy: "Preparing for development").count == 2)
+        #expect(text.components(separatedBy: "Setup failed, retrying: ERROR: mount failed").count == 2)
         #expect(text.contains("iPhone: ready"))
         #expect(text.contains("added to pipeline Pipeline 1"))
     }

@@ -24,8 +24,9 @@ struct PhysicalDevice: Hashable, Sendable {
 }
 
 enum DeviceDiscovery {
-    /// Physical devices (via devicectl) and booted simulators (via simctl).
-    static func discover() async -> (physical: [PhysicalDevice], simulators: [DiscoveredDevice]) {
+    /// Physical devices (via devicectl) and booted simulators (via simctl). `physical` is nil when
+    /// devicectl failed, which is not the same as no devices.
+    static func discover() async -> (physical: [PhysicalDevice]?, simulators: [DiscoveredDevice]) {
         async let physical = physicalDevices()
         async let simulators = bootedSimulators()
         return (await physical, await simulators)
@@ -54,20 +55,20 @@ enum DeviceDiscovery {
         return all.filter(\.isConnected) + all.filter { !$0.isConnected }
     }
 
-    private static func physicalDevices() async -> [PhysicalDevice] {
+    private static func physicalDevices() async -> [PhysicalDevice]? {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("orchard-devices-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: output) }
         guard (try? await Shell.xcrun(["devicectl", "list", "devices", "--quiet", "--json-output", output.path])) != nil,
               let data = try? Data(contentsOf: output)
-        else { return [] }
+        else { return nil }
         return physicalDevices(fromJSON: data)
     }
 
     /// Parses `devicectl list devices --json-output`. Reads the `properties` dictionary and falls
     /// back to the deprecated top-level ones, which are all an older Xcode writes.
-    static func physicalDevices(fromJSON data: Data) -> [PhysicalDevice] {
-        guard let response = try? JSONDecoder().decode(DeviceCtlResponse.self, from: data) else { return [] }
+    static func physicalDevices(fromJSON data: Data) -> [PhysicalDevice]? {
+        guard let response = try? JSONDecoder().decode(DeviceCtlResponse.self, from: data) else { return nil }
         return response.result.devices.compactMap { entry in
             let hardware = entry.properties?.hardware ?? entry.hardwareProperties
             let connection = entry.properties?.connection

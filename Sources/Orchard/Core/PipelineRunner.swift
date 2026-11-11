@@ -103,6 +103,7 @@ final class PipelineRunner: Identifiable {
     private func stop() {
         loopTask?.cancel()
         loopTask = nil
+        newDevices = []
         nextCheck = nil
         if !status.isBusy { status = .disabled }
         append(.info, "Disabled")
@@ -122,10 +123,15 @@ final class PipelineRunner: Identifiable {
         Task { await deployToNewDevices() }
     }
 
-    /// Waits while the pipeline is busy; the poll loop comes back to it.
+    /// Waits while the pipeline is busy; the poll loop comes back to it. A device stays queued
+    /// until a run for it starts, so a check that fails (no network) is tried again.
     private func deployToNewDevices() async {
-        while config.isEnabled, !status.isBusy, runTask == nil, !newDevices.isEmpty {
-            await check(force: true, newDevice: newDevices.removeFirst())
+        while config.isEnabled, !status.isBusy, runTask == nil {
+            // The user may have unticked it since.
+            newDevices.removeAll { device in !config.devices.contains { $0.id == device.id } }
+            guard let device = newDevices.first else { return }
+            await check(force: true, newDevice: device)
+            if newDevices.first?.id == device.id { return }
         }
     }
 
@@ -156,11 +162,13 @@ final class PipelineRunner: Identifiable {
             remoteHead = head
             lastError = nil
             let isNew = head != config.lastDeployedCommit && head != config.lastAttemptedCommit
-            guard force || isNew else { return }
+            // Another check may have started a run while this one was asking for the head.
+            guard force || isNew, runTask == nil else { return }
             log = log.keepingRuns(config.keptRuns - 1)
             history?.replaceLog(with: log)
             var snapshot = config
             if let newDevice {
+                newDevices.removeAll { $0.id == newDevice.id }
                 // The others already run this commit. A commit they don't have yet goes to everyone.
                 if head == config.lastDeployedCommit { snapshot.devices = [newDevice] }
                 append(.step, "Deploying \(branch) @ \(head.shortSHA) to new device \(newDevice.name)", startsRun: true)

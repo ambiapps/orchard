@@ -92,7 +92,7 @@ struct DeviceDiscoveryTests {
     """#
 
     private func parsed(_ id: String) -> PhysicalDevice? {
-        DeviceDiscovery.physicalDevices(fromJSON: Data(Self.json.utf8)).first { $0.device.id == id }
+        DeviceDiscovery.physicalDevices(fromJSON: Data(Self.json.utf8))?.first { $0.device.id == id }
     }
 
     @Test func parsesAConnectedDeviceOnTheNetwork() throws {
@@ -145,7 +145,7 @@ struct DeviceDiscoveryTests {
     }
 
     @Test func listsUnpairedDevicesOnlyWhileTheyAreSetUp() {
-        let physical = DeviceDiscovery.physicalDevices(fromJSON: Data(Self.json.utf8))
+        let physical = DeviceDiscovery.physicalDevices(fromJSON: Data(Self.json.utf8)) ?? []
         let paired = [Device.thisMac.id, "NODEVMODE", "OLDXCODE", "WIFI", "AWAY", "ASLEEP"]
         // Without automatic setup the list is what it always was: paired devices only.
         #expect(DeviceDiscovery.devices(physical: physical, simulators: []).map(\.id) == paired)
@@ -154,7 +154,9 @@ struct DeviceDiscoveryTests {
         #expect(rows.first { $0.id == "NEW" }?.onboarding == .waitingForTrust)
     }
 
-    @Test func garbageParsesToNoDevices() {
-        #expect(DeviceDiscovery.physicalDevices(fromJSON: Data("not json".utf8)).isEmpty)
+    /// Not an empty list: a listing that failed mustn't look like every device was unplugged.
+    @Test func garbageIsAFailureNotAnEmptyList() {
+        #expect(DeviceDiscovery.physicalDevices(fromJSON: Data("not json".utf8)) == nil)
+        #expect(DeviceDiscovery.physicalDevices(fromJSON: Data(#"{"result": {"devices": []}}"#.utf8)) == [])
     }
 }

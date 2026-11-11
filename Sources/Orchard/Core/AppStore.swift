@@ -100,7 +100,14 @@ final class AppStore {
     private func discoverDevices() async {
         let found = await DeviceDiscovery.discover()
         simulators = found.simulators
-        onboard(found.physical)
+        // A failed listing says nothing about the devices: no physical ones are listed, as
+        // before, but the ones being set up aren't forgotten.
+        if let physical = found.physical {
+            onboard(physical)
+        } else {
+            physical = []
+            updateDevices()
+        }
     }
 
     // MARK: Automatic setup
@@ -131,7 +138,13 @@ final class AppStore {
             case .wait(let state):
                 setOnboarding(state, for: device)
             case .pair, .prepare:
-                setOnboarding(step == .pair ? .waitingForTrust : .preparing, for: device)
+                // A retry keeps showing why the last try failed, instead of flipping to
+                // "Preparing…" and back (and logging both) on every poll.
+                switch (step, onboarding[id]) {
+                case (.pair, _): setOnboarding(.waitingForTrust, for: device)
+                case (_, .failed), (_, .developerModeOff): break
+                default: setOnboarding(.preparing, for: device)
+                }
                 let command = step == .pair ? commands.pair : commands.prepare
                 onboardingTasks[id] = Task { [weak self] in
                     let result = await Result { try await command(id) }
