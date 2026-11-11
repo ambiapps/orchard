@@ -238,36 +238,69 @@ final class PipelineRunner: Identifiable {
 
             let groups = Dictionary(grouping: config.devices, by: \.platform)
             for platform in BuildPlatform.allCases {
-                guard let devices = groups[platform] else { continue }
+                guard var devices = groups[platform] else { continue }
                 try Task.checkCancellation()
 
-                status = .building(platform)
-                runs.forgetProducts(keeping: record.id)
-                append(.step, "Building \(scheme) (\(config.configuration)) for \(platform.displayName)")
-                let buildStart = Date()
-                let product: BuiltProduct
-                do {
+                /// Builds the platform; nil when the build failed, which fails its devices unless
+                /// `failingDevices` is false.
+                func buildProduct(failingDevices: Bool = true) async throws -> BuiltProduct? {
+                    let buildStart = Date()
                     defer {
                         timings.build += Date().timeIntervalSince(buildStart)
                         update { $0.timings = timings }
                     }
-                    product = try await Xcode.build(
-                        container: config.containerPath, scheme: scheme,
-                        configuration: config.configuration, platform: platform,
-                        registering: newDevice?.platform == platform ? newDevice?.udid : nil,
-                        in: dirs.checkout, derivedData: dirs.derivedData, log: build)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    let elapsed = Date().timeIntervalSince(buildStart).formattedDuration
-                    append(.error, "Build for \(platform.displayName) failed after \(elapsed)")
-                    for device in devices {
-                        update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
+                    do {
+                        let product = try await Xcode.build(
+                            container: config.containerPath, scheme: scheme,
+                            configuration: config.configuration, platform: platform,
+                            registering: newDevice?.platform == platform ? newDevice?.udid : nil,
+                            in: dirs.checkout, derivedData: dirs.derivedData, log: build)
+                        append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
+                        return product
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        let elapsed = Date().timeIntervalSince(buildStart).formattedDuration
+                        append(.error, "Build for \(platform.displayName) failed after \(elapsed)")
+                        if failingDevices {
+                            for device in devices {
+                                update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
+                            }
+                        }
+                        raw("BUILD FAILED: \(error.localizedDescription)")
+                        return nil
                     }
-                    raw("BUILD FAILED: \(error.localizedDescription)")
-                    continue
                 }
-                append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
+
+                status = .building(platform)
+                runs.forgetProducts(keeping: record.id)
+                append(.step, "Building \(scheme) (\(config.configuration)) for \(platform.displayName)")
+                guard var product = try await buildProduct() else { continue }
+
+                // The generic destination gives xcodebuild no reason to refresh a cached profile
+                // that predates a device, so check it here and refresh it once ourselves.
+                if platform.needsDeviceProvisioning {
+                    devices = await rememberingUDIDs(of: devices)
+                    let missing = Provisioning.devicesMissing(fromProfilesIn: product.appURL, devices: devices)
+                    // Building again only helps when the profile is one Xcode will download anew.
+                    if !missing.isEmpty, Provisioning.canRefreshProfiles(in: product.appURL, missing: missing) {
+                        let removed = Provisioning.removeXcodeManagedProfiles()
+                        if removed > 0 {
+                            let names = missing.map(\.name).joined(separator: ", ")
+                            append(.warning, "The provisioning profile doesn't include \(names). Removed \(removed) cached Xcode-managed profile(s); building again")
+                            try Task.checkCancellation()
+                            if let rebuilt = try await buildProduct(failingDevices: false) {
+                                product = rebuilt
+                            } else if !FileManager.default.fileExists(atPath: product.appURL.path) {
+                                for device in devices {
+                                    update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
+                                }
+                                continue
+                            }
+                            // Otherwise the first build is still there for the devices it covers.
+                        }
+                    }
+                }
                 update { $0.products = ($0.products ?? [:]).merging([platform.rawValue: product]) { $1 } }
 
                 try Task.checkCancellation()
@@ -339,6 +372,7 @@ final class PipelineRunner: Identifiable {
             guard let index = runs.firstIndex(where: { $0.id == run.id }) else { return }
             change(&runs[index])
         }
+        let device = await rememberingUDIDs(of: [device]).first ?? device
         let logFile = run.logFile.flatMap(LogFile.init(appendingTo:))
         defer { logFile?.close() }
         let raw: @Sendable (String) -> Void
@@ -362,6 +396,17 @@ final class PipelineRunner: Identifiable {
             config.lastDeployedCommit = run.commit
             config.lastDeployedAt = Date()
         }
+    }
+
+    /// `devices` with their hardware UDIDs, saving the ones found for devices chosen before
+    /// Orchard stored them, so devicectl is asked only once.
+    private func rememberingUDIDs(of devices: [Device]) async -> [Device] {
+        let filled = await DeviceDiscovery.fillingUDIDs(devices)
+        for device in filled where device.udid != nil {
+            guard let index = config.devices.firstIndex(where: { $0.id == device.id && $0.udid == nil }) else { continue }
+            config.devices[index].udid = device.udid
+        }
+        return filled
     }
 
     /// Installs and launches `product` on all of `devices` at the same time, recording each
@@ -388,6 +433,7 @@ final class PipelineRunner: Identifiable {
     }
 
     /// Installs and launches `product` on `device`, recording its outcome on the run as it goes.
+    /// A device the app's provisioning profile doesn't list fails without an install attempt.
     /// Throws only `CancellationError`; a failed deploy is an outcome.
     private func deploy(_ product: BuiltProduct, to device: Device, run: RunRecord.ID,
                         log: @escaping @Sendable (String) -> Void, announce: Bool) async throws {
@@ -397,6 +443,13 @@ final class PipelineRunner: Identifiable {
         }
         report(.running)
         if announce { append(.step, "Deploying to \(device.name)") }
+        // Installing would fail with an opaque ApplicationVerificationFailed; say why instead.
+        if !Provisioning.devicesMissing(fromProfilesIn: product.appURL, devices: [device]).isEmpty {
+            let message = Provisioning.unregisteredMessage(for: device)
+            report(.failed(message))
+            append(.error, message)
+            return
+        }
         let start = Date()
         do {
             try await deployer(product, device, log)

@@ -38,6 +38,16 @@ struct PipelineConfigTests {
         #expect(config.addsNewDevices)
     }
 
+    /// Devices saved before `udid` existed must still decode, or every pipeline is lost.
+    @Test func decodesADeviceSavedWithoutUDID() throws {
+        let json = #"""
+        {"id":"A1","name":"iPhone","model":"iPhone 17","kind":"physical","platform":"iOS","osVersion":"27.0"}
+        """#
+        let device = try JSONDecoder().decode(Device.self, from: Data(json.utf8))
+        #expect(device.id == "A1")
+        #expect(device.udid == nil)
+    }
+
     @Test func shortSHA() {
         #expect("0123456789abcdef".shortSHA == "01234567")
         #expect("abc".shortSHA == "abc")

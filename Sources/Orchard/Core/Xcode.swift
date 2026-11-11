@@ -74,7 +74,7 @@ enum Xcode {
             "-destination", udid.map { "id=\($0)" } ?? platform.genericDestination,
             "-derivedDataPath", derivedData.path,
         ]
-        if !platform.isSimulator && platform != .macOS {
+        if platform.needsDeviceProvisioning {
             common += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
         }
 

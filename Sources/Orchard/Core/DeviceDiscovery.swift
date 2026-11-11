@@ -62,6 +62,19 @@ enum DeviceDiscovery {
             .map(\.element)
     }
 
+    /// `devices` with the hardware UDID filled in for physical devices that were saved without
+    /// one. Asks devicectl only when one is missing; a device it doesn't know stays as it is.
+    static func fillingUDIDs(_ devices: [Device]) async -> [Device] {
+        guard devices.contains(where: { $0.kind == .physical && $0.udid == nil }) else { return devices }
+        let known = await physicalDevices() ?? []
+        return devices.map { device in
+            guard device.kind == .physical, device.udid == nil else { return device }
+            var device = device
+            device.udid = known.first { $0.device.id == device.id }?.device.udid
+            return device
+        }
+    }
+
     private static func physicalDevices() async -> [PhysicalDevice]? {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("orchard-devices-\(UUID().uuidString).json")

@@ -51,6 +51,9 @@ enum BuildPlatform: String, Codable, Hashable, CaseIterable, Sendable {
 
     var isSimulator: Bool { rawValue.hasSuffix("Simulator") }
 
+    /// Whether apps for this platform are signed with a profile that lists the devices they run on.
+    var needsDeviceProvisioning: Bool { !isSimulator && self != .macOS }
+
     /// Maps devicectl / simctl platform names (`iOS`, `xrOS`, …) to a build platform.
     init?(devicePlatform: String, simulator: Bool) {
         switch (devicePlatform.lowercased(), simulator) {
@@ -83,8 +86,9 @@ struct Device: Codable, Hashable, Identifiable, Sendable {
     var kind: DeviceKind
     var platform: BuildPlatform
     var osVersion: String
-    /// Hardware UDID of a physical device, which `xcodebuild -destination id=` takes.
-    /// Optional so older saved configs decode.
+    /// Hardware UDID of a physical device, as provisioning profiles list it and as
+    /// `xcodebuild -destination id=` takes it (`id` is devicectl's own identifier). Optional so
+    /// devices saved before it existed decode.
     var udid: String?
 
     static let thisMac = Device(
