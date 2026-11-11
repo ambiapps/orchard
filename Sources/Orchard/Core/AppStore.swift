@@ -147,7 +147,13 @@ final class AppStore {
                 }
                 let command = step == .pair ? commands.pair : commands.prepare
                 onboardingTasks[id] = Task { [weak self] in
-                    let result = await Result { try await command(id) }
+                    let result: Result<Void, Error>
+                    do {
+                        try await command(id)
+                        result = .success(())
+                    } catch {
+                        result = .failure(error)
+                    }
                     guard let self, !Task.isCancelled else { return }
                     self.onboardingTasks[id] = nil
                     self.finished(step, for: device, result: result)
