@@ -83,6 +83,9 @@ struct Device: Codable, Hashable, Identifiable, Sendable {
     var kind: DeviceKind
     var platform: BuildPlatform
     var osVersion: String
+    /// Hardware UDID of a physical device, which `xcodebuild -destination id=` takes.
+    /// Optional so older saved configs decode.
+    var udid: String?
 
     static let thisMac = Device(
         id: "this-mac",
@@ -126,6 +129,11 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     /// Optional so older saved configs decode.
     var historyLimit: Int?
     var keptRuns: Int { max(1, historyLimit ?? 20) }
+    /// Whether devices that automatic setup brings in are added to this pipeline; nil means yes.
+    /// Only used while "Set up connected devices automatically" is on. Optional so older saved
+    /// configs decode.
+    var deploysToNewDevices: Bool?
+    var addsNewDevices: Bool { deploysToNewDevices ?? true }
 
     /// Last commit installed on every device (launching it may have failed, e.g. on a locked phone).
     var lastDeployedCommit: String?

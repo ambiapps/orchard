@@ -33,6 +33,11 @@ struct OrchardApp: App {
             }
         }
 
+        Settings {
+            SettingsView()
+                .environment(store)
+        }
+
         MenuBarExtra {
             MenuBarContent()
                 .environment(store)

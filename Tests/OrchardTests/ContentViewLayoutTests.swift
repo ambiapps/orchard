@@ -84,6 +84,16 @@ struct ContentViewLayoutTests {
             }
 
             try devicesSnapshot(appearance: appearance, to: directory.appendingPathComponent("devices-\(name).png"))
+            try onboardingSnapshot(appearance: appearance, to: directory.appendingPathComponent("onboarding-\(name).png"))
+            for isOn in [false, true] {
+                let store = makeTestStore()
+                store.setsUpDevicesAutomatically = isOn
+                let settings = WindowHarness(SettingsView().environment(store), size: NSSize(width: 460, height: 200),
+                                             appearance: appearance)
+                defer { settings.close() }
+                settings.window.title = "Orchard Settings"
+                try settings.snapshot(to: directory.appendingPathComponent("settings-\(isOn ? "on" : "off")-\(name).png"))
+            }
 
             let store = makeTestStore()
             let runner = store.pipelines[0]
@@ -133,6 +143,39 @@ struct ContentViewLayoutTests {
         let runner = store.addPipeline()
         runner.config.devices = [iPhone, oldPhone]
         let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
+    }
+
+    /// The settings column with automatic setup on: a device in each setup state, and the
+    /// "Deploy to new devices" toggle.
+    private func onboardingSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+        func row(_ name: String, _ model: String, version: String = "27.0", connected: Bool = false,
+                 _ state: OnboardingState?) -> DiscoveredDevice {
+            DiscoveredDevice(
+                device: Device(id: name, name: name, model: model, kind: .physical, platform: .iOS, osVersion: version),
+                isConnected: connected, onboarding: state)
+        }
+        let ready = row("Office iPhone", "iPhone 17 Pro", connected: true, nil)
+        let store = AppStore(defaults: nil, discoversDevices: false, devices: [
+            DiscoveredDevice(device: Device(id: "this-mac", name: "Mac Studio", model: "This Mac",
+                                            kind: .thisMac, platform: .macOS, osVersion: "27.0"), isConnected: true),
+            ready,
+            row("Preparing iPhone", "iPhone 17", connected: true, .preparing),
+            row("New iPhone", "iPhone", version: "", .waitingForTrust),
+            row("Unplugged iPhone", "iPhone", version: "", .waitingForCable),
+            row("Fresh iPad", "iPad Air", .developerModeOff),
+            row("Away iPhone", "iPhone 16", .unreachable),
+            row("Stuck iPhone", "iPhone 15", .failed("The developer disk image could not be mounted")),
+        ])
+        store.setsUpDevicesAutomatically = true
+        let runner = store.addPipeline()
+        runner.config.devices = [ready.device]
+        let view = ContentView()
+            .environment(store)
+            .frame(minWidth: Layout.windowMinWidth, minHeight: Layout.windowMinHeight)
+        let harness = WindowHarness(view, size: NSSize(width: 1100, height: 1000), appearance: appearance)
         defer { harness.close() }
         harness.window.title = runner.config.name
         try harness.snapshot(to: url)

@@ -3,15 +3,44 @@ import Foundation
 struct DiscoveredDevice: Identifiable, Hashable, Sendable {
     var device: Device
     var isConnected: Bool
+    /// Where automatic setup is with this device; nil when it isn't being set up.
+    var onboarding: OnboardingState? = nil
     var id: String { device.id }
 }
 
+/// A physical device as `devicectl list devices` reports it, paired or not.
+struct PhysicalDevice: Hashable, Sendable {
+    enum Pairing: Hashable, Sendable { case paired, unpaired, inProgress }
+    var device: Device
+    var pairing: Pairing
+    /// Connected by cable, which pairing needs.
+    var isWired: Bool
+    /// Reachable by cable or over the network; devicectl connects the tunnel on demand.
+    var isReachable: Bool
+    /// The tunnel is up right now.
+    var isConnected: Bool
+    /// Nil when devicectl doesn't know (yet).
+    var developerMode: Bool?
+}
+
 enum DeviceDiscovery {
-    /// This Mac, paired physical devices (via devicectl) and booted simulators (via simctl).
-    static func discover() async -> [DiscoveredDevice] {
+    /// Physical devices (via devicectl) and booted simulators (via simctl).
+    static func discover() async -> (physical: [PhysicalDevice], simulators: [DiscoveredDevice]) {
         async let physical = physicalDevices()
         async let simulators = bootedSimulators()
-        return [DiscoveredDevice(device: .thisMac, isConnected: true)] + (await physical) + (await simulators)
+        return (await physical, await simulators)
+    }
+
+    /// The devices to offer: this Mac, paired physical devices and booted simulators. A device that
+    /// automatic setup is working on carries its state, and is listed even before it's paired.
+    static func devices(physical: [PhysicalDevice], simulators: [DiscoveredDevice],
+                        onboarding: [String: OnboardingState] = [:]) -> [DiscoveredDevice] {
+        let rows = physical
+            .filter { $0.pairing == .paired || onboarding[$0.device.id] != nil }
+            .map { DiscoveredDevice(device: $0.device, isConnected: $0.isConnected,
+                                    onboarding: onboarding[$0.device.id]) }
+            .sorted { ($0.isConnected ? 0 : 1, $0.device.name) < ($1.isConnected ? 0 : 1, $1.device.name) }
+        return [DiscoveredDevice(device: .thisMac, isConnected: true)] + rows + simulators
     }
 
     /// Rows for the device list: discovered devices plus selected ones that weren't discovered,
@@ -25,32 +54,57 @@ enum DeviceDiscovery {
         return all.filter(\.isConnected) + all.filter { !$0.isConnected }
     }
 
-    private static func physicalDevices() async -> [DiscoveredDevice] {
+    private static func physicalDevices() async -> [PhysicalDevice] {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("orchard-devices-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: output) }
         guard (try? await Shell.xcrun(["devicectl", "list", "devices", "--quiet", "--json-output", output.path])) != nil,
-              let data = try? Data(contentsOf: output),
-              let response = try? JSONDecoder().decode(DeviceCtlResponse.self, from: data)
+              let data = try? Data(contentsOf: output)
         else { return [] }
+        return physicalDevices(fromJSON: data)
+    }
 
+    /// Parses `devicectl list devices --json-output`. Reads the `properties` dictionary and falls
+    /// back to the deprecated top-level ones, which are all an older Xcode writes.
+    static func physicalDevices(fromJSON data: Data) -> [PhysicalDevice] {
+        guard let response = try? JSONDecoder().decode(DeviceCtlResponse.self, from: data) else { return [] }
         return response.result.devices.compactMap { entry in
-            guard entry.hardwareProperties.reality == "physical",
-                  entry.connectionProperties.pairingState == "paired",
-                  let platformName = entry.hardwareProperties.platform,
-                  let platform = BuildPlatform(devicePlatform: platformName, simulator: false)
+            let hardware = entry.properties?.hardware ?? entry.hardwareProperties
+            let connection = entry.properties?.connection
+            let pairing: PhysicalDevice.Pairing
+            switch connection?.pairingState ?? entry.connectionProperties?.pairingState {
+            case "paired": pairing = .paired
+            case "unpaired": pairing = .unpaired
+            case "pairingInProgress": pairing = .inProgress
+            default: return nil
+            }
+            // A device that isn't paired yet may not report its hardware; only simulators are ruled out.
+            guard pairing == .paired ? hardware?.reality == "physical" : hardware?.reality != "simulated"
             else { return nil }
+            let platform = hardware?.platform.flatMap { BuildPlatform(devicePlatform: $0, simulator: false) }
+            guard let platform = platform ?? (pairing == .paired ? nil : .iOS) else { return nil }
+
+            let marketingName = hardware?.marketingName
             let device = Device(
                 id: entry.identifier,
-                name: entry.deviceProperties.name ?? entry.hardwareProperties.marketingName ?? "Device",
-                model: entry.hardwareProperties.marketingName ?? entry.hardwareProperties.deviceType ?? platformName,
+                name: entry.properties?.state?.name ?? entry.deviceProperties?.name ?? marketingName ?? "Device",
+                model: marketingName ?? hardware?.deviceType ?? platform.displayName,
                 kind: .physical,
                 platform: platform,
-                osVersion: entry.deviceProperties.osVersionNumber ?? ""
+                osVersion: entry.properties?.software?.osVersionNumber?.stringValue
+                    ?? entry.deviceProperties?.osVersionNumber ?? "",
+                udid: hardware?.udid
             )
-            return DiscoveredDevice(device: device, isConnected: entry.connectionProperties.tunnelState == "connected")
+            let state = connection?.state ?? entry.connectionProperties?.tunnelState
+            let transport = connection?.transportType ?? entry.connectionProperties?.transportType
+            return PhysicalDevice(
+                device: device, pairing: pairing,
+                isWired: transport == "wired",
+                isReachable: state == "connected" || (state == "disconnected" && transport != nil),
+                isConnected: state == "connected",
+                developerMode: (entry.properties?.state?.developerModeStatus
+                    ?? entry.deviceProperties?.developerModeStatus)?.isEnabled)
         }
-        .sorted { ($0.isConnected ? 0 : 1, $0.device.name) < ($1.isConnected ? 0 : 1, $1.device.name) }
     }
 
     private static func bootedSimulators() async -> [DiscoveredDevice] {
@@ -83,22 +137,59 @@ private struct DeviceCtlResponse: Decodable {
     struct Entry: Decodable {
         struct Connection: Decodable {
             var pairingState: String?
+            /// "connected", "disconnected" (reachable, tunnel down) or "unavailable".
+            var state: String?
+            /// The deprecated name of `state`.
             var tunnelState: String?
+            /// "wired" or "localNetwork"; missing when the device can't be reached.
+            var transportType: String?
         }
-        struct Properties: Decodable {
+        /// `{"enabled": {…}}` in `properties`, a plain "enabled" in the deprecated dictionary.
+        struct DeveloperMode: Decodable {
+            var isEnabled: Bool
+            init(from decoder: Decoder) throws {
+                if let name = try? decoder.singleValueContainer().decode(String.self) {
+                    isEnabled = name == "enabled"
+                } else {
+                    isEnabled = try decoder.container(keyedBy: Key.self).allKeys.contains { $0.stringValue == "enabled" }
+                }
+            }
+            struct Key: CodingKey {
+                var stringValue: String
+                var intValue: Int? { nil }
+                init?(stringValue: String) { self.stringValue = stringValue }
+                init?(intValue: Int) { nil }
+            }
+        }
+        struct State: Decodable {
             var name: String?
-            var osVersionNumber: String?
+            var developerModeStatus: DeveloperMode?
         }
+        struct Version: Decodable { var stringValue: String? }
+        struct Software: Decodable { var osVersionNumber: Version? }
         struct Hardware: Decodable {
             var platform: String?
             var reality: String?
             var marketingName: String?
             var deviceType: String?
+            var udid: String?
+        }
+        struct Properties: Decodable {
+            var connection: Connection?
+            var hardware: Hardware?
+            var software: Software?
+            var state: State?
+        }
+        struct DeprecatedProperties: Decodable {
+            var name: String?
+            var osVersionNumber: String?
+            var developerModeStatus: DeveloperMode?
         }
         var identifier: String
-        var connectionProperties: Connection
-        var deviceProperties: Properties
-        var hardwareProperties: Hardware
+        var properties: Properties?
+        var connectionProperties: Connection?
+        var deviceProperties: DeprecatedProperties?
+        var hardwareProperties: Hardware?
     }
     var result: Result
 }

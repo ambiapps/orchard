@@ -59,6 +59,8 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private let history: PipelineHistory?
+    /// Devices that automatic setup just added and that still need their first deploy.
+    @ObservationIgnored private var newDevices: [Device] = []
 
     nonisolated var id: UUID { _id }
     @ObservationIgnored private nonisolated let _id: UUID
@@ -90,6 +92,7 @@ final class PipelineRunner: Identifiable {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.check(force: false)
+                await self.deployToNewDevices()
                 let interval = max(10, self.config.pollInterval)
                 self.nextCheck = Date().addingTimeInterval(interval)
                 try? await Task.sleep(for: .seconds(interval))
@@ -111,6 +114,21 @@ final class PipelineRunner: Identifiable {
         Task { await check(force: true) }
     }
 
+    /// Deploys the branch head to a device that automatic setup just added, without waiting for
+    /// the next commit. An enabled pipeline only; a disabled one deploys nothing by itself.
+    func deploy(toNew device: Device) {
+        guard config.isEnabled else { return }
+        newDevices.append(device)
+        Task { await deployToNewDevices() }
+    }
+
+    /// Waits while the pipeline is busy; the poll loop comes back to it.
+    private func deployToNewDevices() async {
+        while config.isEnabled, !status.isBusy, runTask == nil, !newDevices.isEmpty {
+            await check(force: true, newDevice: newDevices.removeFirst())
+        }
+    }
+
     func cancelRun() {
         runTask?.cancel()
     }
@@ -122,7 +140,7 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Polling
 
-    private func check(force: Bool) async {
+    private func check(force: Bool, newDevice: Device? = nil) async {
         guard runTask == nil else { return }
         if let missing = config.missingSetup {
             lastError = missing
@@ -141,11 +159,17 @@ final class PipelineRunner: Identifiable {
             guard force || isNew else { return }
             log = log.keepingRuns(config.keptRuns - 1)
             history?.replaceLog(with: log)
-            append(.step, force ? "Deploying \(branch) @ \(head.shortSHA) on request"
-                                : "New commit on \(branch): \(head.shortSHA)", startsRun: true)
+            var snapshot = config
+            if let newDevice {
+                // The others already run this commit. A commit they don't have yet goes to everyone.
+                if head == config.lastDeployedCommit { snapshot.devices = [newDevice] }
+                append(.step, "Deploying \(branch) @ \(head.shortSHA) to new device \(newDevice.name)", startsRun: true)
+            } else {
+                append(.step, force ? "Deploying \(branch) @ \(head.shortSHA) on request"
+                                    : "New commit on \(branch): \(head.shortSHA)", startsRun: true)
+            }
 
-            let snapshot = config
-            let task = Task { await self.run(commit: head, config: snapshot) }
+            let task = Task { await self.run(commit: head, config: snapshot, newDevice: newDevice) }
             runTask = task
             await task.value
             runTask = nil
@@ -159,7 +183,8 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Build & deploy
 
-    private func run(commit: String, config: PipelineConfig) async {
+    /// `newDevice` is the destination of its platform's build, so xcodebuild registers it with the team.
+    private func run(commit: String, config: PipelineConfig, newDevice: Device? = nil) async {
         guard let repo = config.repoURL, let branch = config.branch, let scheme = config.scheme else { return }
         self.config.lastAttemptedCommit = commit
 
@@ -211,6 +236,7 @@ final class PipelineRunner: Identifiable {
                     product = try await Xcode.build(
                         container: config.containerPath, scheme: scheme,
                         configuration: config.configuration, platform: platform,
+                        registering: newDevice?.platform == platform ? newDevice?.udid : nil,
                         in: dirs.checkout, derivedData: dirs.derivedData, log: build)
                 } catch is CancellationError {
                     throw CancellationError()

@@ -59,15 +59,19 @@ enum Xcode {
     }
 
     /// Builds `scheme` once for `platform` and returns the .app it produced.
+    /// With `registering`, a device's hardware UDID, that device is the destination instead of
+    /// the generic one: xcodebuild only registers its destination device with the team
+    /// (`-allowProvisioningDeviceRegistration`), and a generic destination has none.
     static func build(
         container: String?, scheme: String, configuration: String, platform: BuildPlatform,
+        registering udid: String? = nil,
         in checkout: URL, derivedData: URL,
         log: @escaping @Sendable (String) -> Void
     ) async throws -> BuiltProduct {
         var common = containerArguments(container) + [
             "-scheme", scheme,
             "-configuration", configuration,
-            "-destination", platform.genericDestination,
+            "-destination", udid.map { "id=\($0)" } ?? platform.genericDestination,
             "-derivedDataPath", derivedData.path,
         ]
         if !platform.isSimulator && platform != .macOS {

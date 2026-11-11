@@ -224,6 +224,13 @@ private struct DevicesSection: View {
                         }
                     }
                 }
+                // Not selectable until it's paired; automatic setup adds it when it's ready.
+                .disabled(row.onboarding != nil && !isSelected(row.device))
+            }
+            if store.setsUpDevicesAutomatically {
+                Toggle("Deploy to new devices", isOn: Binding(
+                    get: { runner.config.addsNewDevices },
+                    set: { runner.config.deploysToNewDevices = $0 }))
             }
         } header: {
             HStack {
@@ -240,7 +247,9 @@ private struct DevicesSection: View {
                 }
             }
         } footer: {
-            Text("Paired devices from Xcode and booted simulators. Devices of the same platform share one build.")
+            Text(store.setsUpDevicesAutomatically
+                 ? "Paired devices and booted simulators. Devices of the same platform share one build. A device plugged into this Mac is set up automatically, and added here if this pipeline deploys to new devices."
+                 : "Paired devices from Xcode and booted simulators. Devices of the same platform share one build.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -254,15 +263,21 @@ private struct DevicesSection: View {
     private func detail(for row: DiscoveredDevice) -> String {
         var parts = [row.device.model]
         if row.device.kind == .physical {
-            parts.append(row.device.platform.displayName + " " + row.device.osVersion)
-            parts.append(row.isConnected ? "Connected" : "Not connected")
+            if !row.device.osVersion.isEmpty {
+                parts.append(row.device.platform.displayName + " " + row.device.osVersion)
+            }
+            parts.append(row.onboarding?.label ?? (row.isConnected ? "Connected" : "Not connected"))
         }
         return parts.joined(separator: " · ")
     }
 
+    private func isSelected(_ device: Device) -> Bool {
+        runner.config.devices.contains { $0.id == device.id }
+    }
+
     private func binding(for device: Device) -> Binding<Bool> {
         Binding {
-            runner.config.devices.contains { $0.id == device.id }
+            isSelected(device)
         } set: { isOn in
             runner.config.devices.removeAll { $0.id == device.id }
             if isOn { runner.config.devices.append(device) }

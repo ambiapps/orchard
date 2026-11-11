@@ -22,7 +22,9 @@ Sources/Orchard/
     Git.swift                 Remote/branch queries via ls-remote, private worktree checkout
     Xcode.swift               Finds .xcworkspace/.xcodeproj/Package.swift, lists schemes, builds, locates the .app
     Deployer.swift            Install + launch on this Mac / physical device / simulator
-    DeviceDiscovery.swift     Paired devices (devicectl JSON) and booted simulators (simctl JSON)
+    DeviceDiscovery.swift     Physical devices (devicectl JSON, paired or not) and booted simulators (simctl JSON)
+    DeviceOnboarding.swift    Automatic setup of devices plugged into a headless Mac: OnboardingState, the
+                              step function, the devicectl commands, DeviceLog (devices.log)
     Shell.swift               Async Process wrapper with login-shell PATH and line streaming. All commands go through it
     Updater.swift             AppVersion (tag/bundle parsing, comparison), GitHub latest-release check, the
                               "Update Available" NSAlert, and self-update (download DMG → stage app → swap script)
@@ -32,6 +34,7 @@ Sources/Orchard/
                               and the detail column's toolbar
     ActivityView.swift        Run history and live log
     UpdateAvailableView.swift The "Update Available" window (SwiftUI in a small non-modal NSWindow)
+    SettingsView.swift        The Settings window: "Set up connected devices automatically"
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
 Resources/AppIcon.icon/       Liquid Glass app icon (Icon Composer document: icon.json + SVG layers)
 VERSION                       Marketing version (CFBundleShortVersionString); every PR bumps its patch digit
@@ -52,6 +55,18 @@ docs/                         README screenshots (light/dark), app-icon/ preview
 4. It runs one `xcodebuild build` per `BuildPlatform` among the chosen devices (generic destination, so all iPhones share one build), with `DEBUG_INFORMATION_FORMAT=dwarf` (no dSYMs). It takes the one `.app` in the default products folder that this build signed (`Xcode.builtApp`; leftovers from earlier schemes aren't re-signed), and reads `-showBuildSettings -json` only when there isn't exactly one, because that reloads the workspace and takes up to a minute on big projects.
 5. It deploys to each device of that platform with `Deployer`. Per-device outcomes go into a `RunRecord`, and the full log goes to `~/Library/Logs/Orchard/<id>/`. Each phase is timed (`RunTimings`, on the `RunRecord` and in the log). `PipelineHistory` persists the runs (`runs.json`, rewritten on every change; unfinished runs load as interrupted) and the window's log (`activity.jsonl`) next to the run logs, writing on a background queue. Line caps cut at a run boundary (`keepingLines`). Both keep `config.keptRuns` builds: each check that starts a run trims the log to the previous `keptRuns - 1` runs (`keepingRuns`, by `LogLine.startsRun`), with 2000 lines as a hard cap on top. A launch that fails after a successful install (a locked phone) is a `.warning`, not a failure: the run still counts as deployed (`RunRecord.finalOutcome`).
 
+## Automatic device setup
+
+Opt-in (`AppStore.setsUpDevicesAutomatically`, UserDefaults key `setsUpDevicesAutomatically`, off by default), for a headless Mac. With it off, nothing below runs: no polling, no pairing, no device added to a pipeline.
+
+1. While it's on, `AppStore` runs `DeviceDiscovery.discover()` every 10 seconds and hands the physical devices to `onboard(_:)`.
+2. Setup starts only for a device that shows up unpaired on a cable (`DeviceOnboarding.shouldStart`); devices the user paired are never touched. Its identifier is saved (`onboardingDevices`), so setup carries on after a relaunch.
+3. Each poll, `DeviceOnboarding.nextStep(for:)` decides from devicectl's fields alone: `pair` (`devicectl manage pair`, which fails until Trust is tapped and is simply asked again), wait (Developer Mode off, unreachable), or `prepare` (`devicectl device info ddiServices`, which mounts the developer disk image). There's no step for Wi-Fi: pairing is what lets CoreDevice reach the device on the local network.
+4. When `prepare` succeeds the device is appended to every pipeline with `addsNewDevices` (`deploysToNewDevices ?? true`), and enabled pipelines run `PipelineRunner.deploy(toNew:)`: a run for just that device, built with `-destination id=<udid>`, because xcodebuild registers only its destination device with the team and a generic destination has none.
+5. State shows on the device row (`DiscoveredDevice.onboarding`) and every change goes to `~/Library/Logs/Orchard/devices.log` (`DeviceLog`). Never add a state that needs someone at the Mac.
+
+`devicectl`'s JSON is read from its `properties` dictionary, falling back to the deprecated `connectionProperties`/`deviceProperties`/`hardwareProperties`. `connection.state` is `connected`, `disconnected` (reachable, tunnel down; devicectl connects on demand) or `unavailable`; `transportType` is `wired` or `localNetwork`.
+
 ## Build, run, test
 
 ```bash
@@ -65,9 +80,9 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Tests
 
-- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`, `PipelineHistoryTests`, `DeviceDiscoveryTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
-- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. Its `OffscreenWindow` sits far off screen and behind everything, so test runs never cover the developer's windows. It still caps its size at the screen's, as AppKit does for on-screen windows (the layout tests pass on CI only with that cap); keep any new test windows off screen the same way (an `NSAlert` panel can't be moved off screen, so lay it out with `layout()` and render it without ordering it in). `makeTestStore()` gives an in-memory `AppStore` (no history on disk) without device discovery; never build one on `.standard` in tests.
-- `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list and a `devices` state with a mixed device list. The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
+- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`, `PipelineHistoryTests`, `DeviceDiscoveryTests`, `DeviceOnboardingTests`. `TemporaryDirectory` is the shared helper for throwaway directories.
+- `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. Its `OffscreenWindow` sits far off screen and behind everything, so test runs never cover the developer's windows. It still caps its size at the screen's, as AppKit does for on-screen windows (the layout tests pass on CI only with that cap); keep any new test windows off screen the same way (an `NSAlert` panel can't be moved off screen, so lay it out with `layout()` and render it without ordering it in). `makeTestStore()` gives an in-memory `AppStore` (no history on disk) without device discovery; never build one on `.standard` in tests. For automatic setup, pass fake `DeviceOnboarding.Commands` to `AppStore`, feed `onboard(_:)` the `PhysicalDevice`s of each poll and `await onboardingSettled()`; tests must never run the real `devicectl manage pair`.
+- `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list a `devices` state with a mixed device list, an `onboarding` state with a device in each automatic-setup state, and the Settings window (`settings-off`, `settings-on`). The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
 - They use `@testable import Orchard`, so test internal (not `private`) symbols. To test something that's `private`, test it through its public entry point, as `GitTests` does for `parseRefs`, or relax it to internal.
 - `GitTests` runs real `git` against temporary repos (a bare repo stands in as `origin`). Pass identity with `-c user.name=… -c user.email=…`, because CI has no global git config.
 - `ORCHARD_NETWORK_TESTS=1 swift test --filter Updater` downloads the latest real release and stages its app, to check the self-update download path end to end. CI doesn't run it.
