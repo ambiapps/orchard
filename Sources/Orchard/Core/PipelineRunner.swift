@@ -40,6 +40,12 @@ final class PipelineRunner: Identifiable {
             guard config != oldValue else { return }
             onChange?()
             if config.isEnabled != oldValue.isEnabled { config.isEnabled ? start() : stop() }
+            if config.scheme != oldValue.scheme || config.containerPath != oldValue.containerPath
+                || config.repoPath != oldValue.repoPath {
+                // The deployed app no longer belongs to this pipeline's build; the next run sets it.
+                config.deployedApps = nil
+                config.crashesSince = nil
+            }
             if config.keptRuns < oldValue.keptRuns {
                 runs = Array(runs.prefix(config.keptRuns))
                 log = log.keepingRuns(config.keptRuns)
@@ -61,6 +67,7 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private let history: PipelineHistory?
+    @ObservationIgnored private var isCheckingCrashes = false
     @ObservationIgnored private let deployer: DeployAction
 
     /// Installs and launches an app on a device, logging the tools' output line by line.
@@ -99,6 +106,7 @@ final class PipelineRunner: Identifiable {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.check(force: false)
+                self.startCrashCheck()
                 let interval = max(10, self.config.pollInterval)
                 self.nextCheck = Date().addingTimeInterval(interval)
                 try? await Task.sleep(for: .seconds(interval))
@@ -274,6 +282,8 @@ final class PipelineRunner: Identifiable {
                 defer {
                     timings.deploy += Date().timeIntervalSince(deployStart)
                     update { $0.timings = timings }
+                    // Also after a cancel: the devices that got the app before it can still crash.
+                    rememberInstalled(product, platform: platform, on: devices, run: record.id)
                 }
                 try await deployAll(product, to: devices, run: record.id, log: raw)
             }
@@ -314,6 +324,88 @@ final class PipelineRunner: Identifiable {
         logFile.close()
     }
 
+    // MARK: Crashes
+
+    /// Makes `product` the app crash checks look for on `platform`, if the run installed it on
+    /// any of `devices` (a `.warning` is installed but not launched).
+    private func rememberInstalled(_ product: BuiltProduct, platform: BuildPlatform,
+                                   on devices: [Device], run: RunRecord.ID) {
+        guard let record = runs.first(where: { $0.id == run }) else { return }
+        let installed = devices.contains { device in
+            switch record.deviceOutcomes[device.id] {
+            case .succeeded, .warning: true
+            default: false
+            }
+        }
+        guard installed else { return }
+        let app = DeployedApp(platform: platform, appPath: product.appURL.path,
+                              executableName: product.executableName)
+        config.deployedApps = (config.deployedApps ?? []).filter { $0.platform != platform } + [app]
+        if config.crashesSince == nil { config.crashesSince = record.startedAt }
+    }
+
+    /// Starts a crash check in its own task, so devices that are slow to answer don't hold up
+    /// polling. Skipped while a run is building or deploying the app the check would read.
+    private func startCrashCheck() {
+        guard !isCheckingCrashes, runTask == nil, config.deployedApps?.isEmpty == false else { return }
+        isCheckingCrashes = true
+        Task {
+            await checkCrashes()
+            isCheckingCrashes = false
+        }
+    }
+
+    /// Logs crash reports of the deployed app that appeared on any device and weren't logged yet.
+    private func checkCrashes() async {
+        guard let apps = config.deployedApps else { return }
+        let since: Date
+        if let crashesSince = config.crashesSince {
+            since = crashesSince
+        } else {
+            since = Date()
+            config.crashesSince = since
+        }
+        let reported = Set(config.reportedCrashes ?? [])
+        let folder = Paths.logs.appendingPathComponent("\(config.id.uuidString)/crashes", isDirectory: true)
+        let targets = config.devices.compactMap { device in
+            apps.first { $0.platform == device.platform }.map { (device, $0) }
+        }
+
+        let found = await withTaskGroup(of: [(CrashReport, URL, String, Device, DeployedApp)].self) { group in
+            for (device, app) in targets {
+                group.addTask {
+                    await CrashReports.newReports(
+                        on: device, executable: app.executableName, since: since,
+                        reported: reported, into: folder)
+                        .map { ($0.report, $0.file, $0.key, device, app) }
+                }
+            }
+            var all: [(CrashReport, URL, String, Device, DeployedApp)] = []
+            for await reports in group { all += reports }
+            return all
+        }
+
+        var logged: [String] = []
+        for (report, file, key, device, app) in found.sorted(by: { $0.0.timestamp < $1.0.timestamp }) {
+            let symbolicated = await CrashReports.symbolicate(report, app: URL(fileURLWithPath: app.appPath))
+            logCrash(symbolicated, on: device, file: file)
+            logged.append(key)
+        }
+        if !logged.isEmpty {
+            config.reportedCrashes = Array(((config.reportedCrashes ?? []) + logged).suffix(CrashReports.reportedLimit))
+        }
+    }
+
+    private func logCrash(_ report: CrashReport, on device: Device, file: URL) {
+        let time = report.timestamp.formatted(date: .omitted, time: .standard)
+        append(.error, "💥 \(report.processName) crashed on \(device.name) at \(time): \(report.exceptionType)")
+        for reason in report.reasons { append(.error, reason) }
+        for frame in report.frameLines() { append(.info, frame) }
+        append(.info, "Crash report: \(file.path)")
+        Notifier.post(title: "\(report.processName) crashed on \(device.name)",
+                      body: report.reasons.first ?? report.exceptionType)
+    }
+
     /// Deploys a device again from a run's build, if that build is still in DerivedData.
     func canRedeploy(_ device: Device, from run: RunRecord) -> Bool {
         guard !status.isBusy, run.deviceOutcomes[device.id]?.canRetry == true,
@@ -346,6 +438,7 @@ final class PipelineRunner: Identifiable {
         append(.step, "Deploying \(run.commit.shortSHA) to \(device.name) again")
         do {
             try await deployAll(product, to: [device], run: run.id, log: raw, announce: false)
+            rememberInstalled(product, platform: device.platform, on: [device], run: run.id)
         } catch {
             // Nothing changed on the device that matters; keep what the run recorded.
             update { $0.deviceOutcomes[device.id] = run.deviceOutcomes[device.id] }

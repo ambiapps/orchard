@@ -3,6 +3,13 @@ import Foundation
 struct BuiltProduct: Hashable, Sendable, Codable {
     var appURL: URL
     var bundleIdentifier: String
+
+    /// `CFBundleExecutable`, the process name crash reports are filed under.
+    var executableName: String {
+        let info = ["Contents/Info.plist", "Info.plist"].lazy
+            .compactMap { NSDictionary(contentsOf: appURL.appendingPathComponent($0)) }.first
+        return info?["CFBundleExecutable"] as? String ?? appURL.deletingPathExtension().lastPathComponent
+    }
 }
 
 enum Xcode {

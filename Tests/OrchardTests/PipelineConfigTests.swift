@@ -29,6 +29,19 @@ struct PipelineConfigTests {
         #expect(decoded == config)
     }
 
+    @Test func decodesConfigSavedBeforeCrashReporting() throws {
+        let saved = """
+        {"id":"6F1D3C1E-2B7A-4C1D-9A55-0E5F2B9C8D11","name":"POC","repoPath":"/tmp/repo","branch":"main",
+         "scheme":"App","configuration":"Debug","devices":[],"pollInterval":60,"isEnabled":true,
+         "lastDeployedCommit":"4a78b7fc"}
+        """
+        let config = try JSONDecoder().decode(PipelineConfig.self, from: Data(saved.utf8))
+        #expect(config.name == "POC")
+        #expect(config.deployedApps == nil)
+        #expect(config.crashesSince == nil)
+        #expect(config.reportedCrashes == nil)
+    }
+
     /// Devices saved before `udid` existed must still decode, or every pipeline is lost.
     @Test func decodesADeviceSavedWithoutUDID() throws {
         let json = #"""

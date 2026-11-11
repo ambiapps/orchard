@@ -139,6 +139,15 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     /// Last commit a run was attempted for, so a broken commit isn't rebuilt on every poll.
     var lastAttemptedCommit: String?
 
+    /// The app the last successful run installed, so crash reports of it can be found and
+    /// symbolicated after a relaunch. Optional so older saved configs decode.
+    var deployedApps: [DeployedApp]?
+    /// Crash reports written before this time are ignored: they predate watching this app.
+    var crashesSince: Date?
+    /// Keys (`CrashReports.key`) of crash reports already logged, newest last, capped at
+    /// `CrashReports.reportedLimit`.
+    var reportedCrashes: [String]?
+
     var repoURL: URL? { repoPath.map { URL(fileURLWithPath: $0) } }
 
     var missingSetup: String? {
@@ -148,6 +157,12 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
         if devices.isEmpty { return "Choose at least one device" }
         return nil
     }
+}
+
+struct DeployedApp: Codable, Hashable, Sendable {
+    var platform: BuildPlatform
+    var appPath: String
+    var executableName: String
 }
 
 enum DeployOutcome: Equatable, Sendable, Codable {
