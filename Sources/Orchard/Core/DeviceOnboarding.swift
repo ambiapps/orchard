@@ -80,12 +80,12 @@ enum DeviceOnboarding {
         static let devicectl = Commands(
             pair: { id in
                 // Shows the Trust dialog on the device and waits for the answer.
-                try await Shell.xcrun(["devicectl", "manage", "pair", "--device", id, "--timeout", "120"])
+                try await Shell.devicectl(["manage", "pair", "--device", id, "--timeout", "120"])
             },
             prepare: { id in
                 // Connects to the device and mounts the developer disk image if it isn't.
-                try await Shell.xcrun(
-                    ["devicectl", "device", "info", "ddiServices", "--device", id, "--timeout", "120"])
+                try await Shell.devicectl(
+                    ["device", "info", "ddiServices", "--device", id, "--timeout", "120"])
             })
     }
 }

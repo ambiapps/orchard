@@ -79,7 +79,7 @@ enum DeviceDiscovery {
         let output = FileManager.default.temporaryDirectory
             .appendingPathComponent("orchard-devices-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: output) }
-        guard (try? await Shell.xcrun(["devicectl", "list", "devices", "--quiet", "--json-output", output.path])) != nil,
+        guard (try? await Shell.devicectl(["list", "devices", "--quiet", "--json-output", output.path])) != nil,
               let data = try? Data(contentsOf: output)
         else { return nil }
         return physicalDevices(fromJSON: data)
@@ -129,7 +129,9 @@ enum DeviceDiscovery {
     }
 
     private static func bootedSimulators() async -> [DiscoveredDevice] {
-        guard let output = try? await Shell.xcrun(["simctl", "list", "devices", "booted", "-j"]),
+        // Without Xcode there are no simulators, and `xcrun` would ask to install developer tools.
+        guard DeviceSupport.hasXcode,
+              let output = try? await Shell.xcrun(["simctl", "list", "devices", "booted", "-j"]),
               let response = try? JSONDecoder().decode(SimctlResponse.self, from: Data(output.utf8))
         else { return [] }
 

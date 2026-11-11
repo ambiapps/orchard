@@ -95,6 +95,26 @@ struct ContentViewLayoutTests {
                 try settings.snapshot(to: directory.appendingPathComponent("settings-\(isOn ? "on" : "off")-\(name).png"))
             }
 
+            for state in ["builder", "client"] {
+                let store = makeTestStore()
+                if state == "builder" {
+                    store.sharesBuilds = true
+                } else {
+                    store.builderLink = "http://office-mac.local:8642/#4f1c…"
+                    store.builderStatus = .connected(name: "Office Mac", pipelines: 2)
+                }
+                let settings = WindowHarness(SettingsView().environment(store), size: NSSize(width: 460, height: 200),
+                                             appearance: appearance)
+                defer { settings.close() }
+                settings.window.title = "Orchard Settings"
+                try settings.snapshot(to: directory.appendingPathComponent("settings-\(state)-\(name).png"))
+            }
+            try clientSnapshot(appearance: appearance, deviceSupport: .installed,
+                               to: directory.appendingPathComponent("client-\(name).png"))
+            try clientSnapshot(appearance: appearance, deviceSupport: .missing,
+                               to: directory.appendingPathComponent("client-setup-\(name).png"))
+            try builderSnapshot(appearance: appearance, to: directory.appendingPathComponent("builder-\(name).png"))
+
             let store = makeTestStore()
             let runner = store.pipelines[0]
             let iPhone = Device(id: "iphone", name: "iPhone", model: "iPhone 17 Pro", kind: .physical,
@@ -121,6 +141,48 @@ struct ContentViewLayoutTests {
 
             try redeploySnapshot(appearance: appearance, to: directory.appendingPathComponent("redeploy-\(name).png"))
         }
+    }
+
+    /// A client's pipeline, which installs a builder's builds; without device support, it offers
+    /// to install it.
+    private func clientSnapshot(appearance: NSAppearance.Name, deviceSupport: AppStore.DeviceSupportState,
+                                to url: URL) throws {
+        let iPhone = Device(id: "iphone", name: "Ada's iPhone", model: "iPhone 17 Pro", kind: .physical,
+                            platform: .iOS, osVersion: "26.0")
+        let this = DiscoveredDevice(device: Device(id: "this-mac", name: "MacBook Air", model: "This Mac",
+                                                   kind: .thisMac, platform: .macOS, osVersion: "26.0"), isConnected: true)
+        let installed = deviceSupport == .installed
+        let store = AppStore(defaults: nil, discoversDevices: false,
+                             devices: installed ? [this, DiscoveredDevice(device: iPhone, isConnected: true)] : [this])
+        store.builderLink = "http://office-mac.local:8642/#token"
+        store.sync(with: .success(BuildCatalog(builder: "Office Mac", hasDeviceSupport: true, pipelines: [
+            SharedPipeline(id: UUID(), name: "Flightradar24", builds: []),
+        ])))
+        store.deviceSupport = deviceSupport
+        let runner = store.pipelines[0]
+        if installed {
+            runner.config.devices = [iPhone]
+            runner.runs = sampleRuns(device: iPhone.id)
+        }
+        let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
+    }
+
+    /// A builder's pipeline, with the platform it also builds for its clients.
+    private func builderSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+        let store = makeTestStore()
+        store.sharesBuilds = true
+        let runner = store.pipelines[0]
+        runner.config.alsoBuilds = .iOS
+        let view = ContentView()
+            .environment(store)
+            .frame(minWidth: Layout.windowMinWidth, minHeight: Layout.windowMinHeight)
+        let harness = WindowHarness(view, size: NSSize(width: 1100, height: 900), appearance: appearance)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
     }
 
     /// A deploy that failed on one of two devices, whose build can be deployed to it again.

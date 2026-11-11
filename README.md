@@ -46,6 +46,23 @@ For a Mac nobody sits at (say, a Mac Studio in the office), turn on **Settings �
 
 Orchard checks `devicectl list devices` every 10 seconds, pairs a device that shows up unpaired on a cable (`devicectl manage pair`, asked again until Trust is tapped), mounts the developer disk image (`devicectl device info ddiServices`; the first time needs internet access), and adds the device to every pipeline whose **Deploy to new devices** toggle is on (the default). Enabled pipelines then deploy their branch head to it right away, with the device as xcodebuild's destination so it's registered with your team. Pairing over the cable is all Wi-Fi needs: CoreDevice finds paired devices on the local network by itself. Each device's progress shows on its row in the device list and in `~/Library/Logs/Orchard/devices.log`; a step that fails is tried again on the next check. Devices you paired yourself are never touched, and the phone has to be on a network where Bonjour reaches the Mac (not a guest network that isolates clients).
 
+### Builder and clients: builds for people without Xcode
+
+One Mac builds; other Macs install its builds on their own devices, without Xcode, the source code or git access. That suits designers and testers, also remote ones.
+
+**On the builder** (the Mac that has pipelines), turn on **Settings → Share builds with other Macs**. From the next build on, each pipeline's app is also zipped and served on port 8642. Settings shows a link, `http://<host>:8642/#<token>`: send it to the clients. For people outside the office network, replace the host with a name they can reach over your VPN or Tailscale. To build iOS when the builder itself has no iPhone chosen, set the pipeline's **Also build for**.
+
+**On a client**, paste the link into **Settings → Builder link**. The builder's pipelines appear in the main window; choose your devices and enable them. Orchard then asks the builder for new builds (every minute by default), downloads each one and installs and launches it.
+
+A client needs no Xcode. `devicectl` comes from a 150 MB Apple-signed package inside the builder's Xcode (`XcodeSystemResources.pkg`); the device list offers to **Install…** it from the builder, after checking Apple's signature, and macOS asks for an administrator password. To pair a phone with a client, turn on **Set up connected devices automatically** there and plug it in.
+
+Things to know:
+
+- A phone has to be in the app's provisioning profile, so register it with your team first: plug it into the builder once with automatic setup on (then untick it there, or the builder keeps trying to reach it), or add its UDID in the developer portal. A client says so when a device isn't in the profile.
+- Development builds need Developer Mode on the phone.
+- The link is the only protection, and traffic is plain HTTP: use it on a network you trust or over a VPN. Anyone with the link can download the builds.
+- The builder keeps one build per pipeline and platform, the latest.
+
 ## How it works
 
 - **Checkout:** a private detached `git worktree` per pipeline in `~/Library/Application Support/Orchard/Pipelines/<id>/` — your own checkout is never touched (other than `git fetch`).
@@ -59,4 +76,4 @@ Orchard checks `devicectl list devices` every 10 seconds, pairs a device that sh
 
 ## Requirements
 
-macOS 15+, Xcode with a signed-in developer account for physical devices, and devices that are paired with Xcode and have Developer Mode on. Devices must be registered in your team (deploying once from Xcode does this). With automatic setup on, Orchard pairs and registers devices itself.
+A Mac that only installs a builder's builds needs macOS 15+ and nothing else. To build: macOS 15+, Xcode with a signed-in developer account for physical devices, and devices that are paired with Xcode and have Developer Mode on. Devices must be registered in your team (deploying once from Xcode does this). With automatic setup on, Orchard pairs and registers devices itself.
