@@ -69,7 +69,8 @@ struct SharingTests {
         let first = try await SharedBuilds.publish(product, platform: .iOS, commit: commit, subject: "One",
                                                    pipeline: pipeline, root: root.url)
         func path(_ build: SharedBuild) -> String { "/v1/builds/\(pipeline.id.uuidString)/\(build.id.uuidString).zip" }
-        let archive = SharedBuilds.directory(pipeline: pipeline.id, root: root.url).appendingPathComponent("iOS.zip")
+        let archive = SharedBuilds.directory(pipeline: pipeline.id, root: root.url)
+            .appendingPathComponent("\(first.id.uuidString).zip")
         #expect(service.response(to: get(path(first))).body == .file(archive))
         #expect(service.response(to: get("/v1/builds/\(pipeline.id.uuidString)/../../secret.zip")).status == 404)
 
@@ -80,6 +81,22 @@ struct SharingTests {
         #expect(service.response(to: get(path(first))).status == 404)
         #expect(service.response(to: get(path(second))).status == 200)
         #expect(SharedBuilds.catalog(root: root.url) == [SharedPipeline(id: pipeline.id, name: "App", builds: [second])])
+    }
+
+    @Test func buildsOfPlatformsNoLongerBuiltAreRemoved() async throws {
+        let root = try TemporaryDirectory()
+        let pipeline = PipelineConfig(name: "App")
+        let product = try makeApp(in: root)
+        let iOS = try await SharedBuilds.publish(product, platform: .iOS, commit: commit, subject: nil,
+                                                 pipeline: pipeline, root: root.url)
+        let tvOS = try await SharedBuilds.publish(product, platform: .tvOS, commit: commit, subject: nil,
+                                                  pipeline: pipeline, root: root.url)
+        SharedBuilds.remove(pipeline: pipeline.id, keeping: [.iOS], root: root.url)
+        #expect(SharedBuilds.catalog(root: root.url).first?.builds == [iOS])
+        #expect(SharedBuilds.archive(pipeline: pipeline.id, build: tvOS.id, root: root.url) == nil)
+        #expect(SharedBuilds.archive(pipeline: pipeline.id, build: iOS.id, root: root.url) != nil)
+        SharedBuilds.removeAll(root: root.url)
+        #expect(SharedBuilds.catalog(root: root.url).isEmpty)
     }
 
     // MARK: Server and client
@@ -162,6 +179,51 @@ struct SharingTests {
         #expect(runner.runs.count == 2)
     }
 
+    /// The builder publishes platforms minutes apart; one platform's new build mustn't
+    /// reinstall the other's.
+    @Test func eachPlatformIsFollowedByItself() async throws {
+        let builderRoot = try TemporaryDirectory()
+        let clientRoot = try TemporaryDirectory()
+        let shared = PipelineConfig(name: "App")
+        let product = try makeApp(in: builderRoot)
+        for platform in [BuildPlatform.macOS, .iOS] {
+            try await SharedBuilds.publish(product, platform: platform, commit: commit, subject: nil,
+                                           pipeline: shared, root: builderRoot.url)
+        }
+        let (server, client) = try await startServer(root: builderRoot.url)
+        defer { server.stop() }
+        let phone = Device(id: "phone", name: "iPhone", model: "iPhone", kind: .physical, platform: .iOS,
+                           osVersion: "26.0", udid: "00008140-000000000000001E")
+        let installed = Installed()
+        let runner = PipelineRunner(
+            config: PipelineConfig(name: "App", devices: [.thisMac, phone], remoteID: shared.id),
+            sharedRoot: clientRoot.url,
+            deployer: { _, device, _ in await installed.add(device) })
+        runner.builder = client
+
+        await runner.check(force: false)
+        #expect(await installed.devices.sorted() == ["iPhone", Device.thisMac.name].sorted())
+
+        let newCommit = String(repeating: "b", count: 40)
+        try await SharedBuilds.publish(product, platform: .iOS, commit: newCommit, subject: nil,
+                                       pipeline: shared, root: builderRoot.url)
+        await runner.check(force: false)
+        #expect(await installed.devices.filter { $0 == "iPhone" }.count == 2)
+        #expect(await installed.devices.filter { $0 == Device.thisMac.name }.count == 1)
+        #expect(runner.runs.first?.commit == newCommit)
+        #expect(runner.runs.first?.outcome == .succeeded)
+        #expect(runner.runs.first?.deviceOutcomes.keys.sorted() == ["phone"])
+    }
+
+    @Test func aPipelineWithoutDevicesOnlyRunsOnABuilder() async {
+        let runner = PipelineRunner(
+            config: PipelineConfig(repoPath: "/nowhere", branch: "main", scheme: "App", alsoBuilds: .iOS),
+            deployer: { _, _, _ in })
+        await runner.check(force: true)
+        #expect(runner.lastError == "Choose at least one device")
+        #expect(runner.runs.isEmpty)
+    }
+
     @Test func remotePipelineSaysWhenTheBuilderHasNoBuild() async throws {
         let builderRoot = try TemporaryDirectory()
         let shared = PipelineConfig(name: "App")
@@ -185,6 +247,8 @@ struct SharingTests {
     private actor Installed {
         private(set) var products: [BuiltProduct] = []
         func add(_ product: BuiltProduct) { products.append(product) }
+        private(set) var devices: [String] = []
+        func add(_ device: Device) { devices.append(device.name) }
     }
 
     // MARK: Store

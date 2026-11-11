@@ -136,6 +136,10 @@ private final class Session: @unchecked Sendable {
     private var buffer = Data()
     private var file: FileHandle?
     private var answered = false
+    private var lastActivity = Date()
+    private var queue: DispatchQueue?
+    /// How long a connection may send or accept nothing before it's dropped.
+    static let idleLimit: TimeInterval = 120
 
     init(connection: NWConnection, service: BuildService) {
         self.connection = connection
@@ -143,12 +147,21 @@ private final class Session: @unchecked Sendable {
     }
 
     func start(on queue: DispatchQueue) {
+        self.queue = queue
         connection.start(queue: queue)
         // A connection that never sends a request doesn't stay around.
         queue.asyncAfter(deadline: .now() + 30) { [self] in
-            if !answered { connection.cancel() }
+            if !answered { close() } else { watch() }
         }
         receive()
+    }
+
+    /// Drops a client that stopped reading in the middle of a file, which would otherwise keep
+    /// the connection and the open archive for good.
+    private func watch() {
+        guard file != nil else { return }
+        if Date().timeIntervalSince(lastActivity) > Self.idleLimit { return close() }
+        queue?.asyncAfter(deadline: .now() + 30) { [self] in watch() }
     }
 
     private func receive() {
@@ -200,6 +213,7 @@ private final class Session: @unchecked Sendable {
             return
         }
         connection.send(content: chunk, completion: .contentProcessed { [self] error in
+            lastActivity = Date()
             error == nil ? sendFile() : close()
         })
     }

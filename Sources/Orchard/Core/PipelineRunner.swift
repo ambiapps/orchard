@@ -177,6 +177,11 @@ final class PipelineRunner: Identifiable {
             await checkRemote(remoteID, force: force, newDevice: newDevice)
             return
         }
+        // "Also build for" only counts on a builder; without sharing there'd be nothing to do.
+        if config.devices.isEmpty, !sharesBuilds {
+            lastError = "Choose at least one device"
+            return
+        }
         guard let repo = config.repoURL, let branch = config.branch else { return }
 
         status = .checking
@@ -256,6 +261,7 @@ final class PipelineRunner: Identifiable {
             let groups = Dictionary(grouping: config.devices, by: \.platform)
             // A builder also builds a platform none of its own devices needs, for its clients.
             let platforms = sharesBuilds ? config.buildPlatforms : Set(groups.keys)
+            if sharesBuilds { SharedBuilds.remove(pipeline: config.id, keeping: platforms, root: sharedRoot) }
             for platform in BuildPlatform.allCases where platforms.contains(platform) {
                 var devices = groups[platform] ?? []
                 try Task.checkCancellation()
@@ -334,6 +340,8 @@ final class PipelineRunner: Identifiable {
                         throw CancellationError()
                     } catch {
                         append(.warning, "Couldn't share the \(platform.displayName) build: \(error.localizedDescription)")
+                        // With no device of its own, sharing was all this build was for.
+                        if devices.isEmpty { buildFailed = true }
                     }
                 }
                 guard !devices.isEmpty else { continue }
@@ -415,8 +423,10 @@ final class PipelineRunner: Identifiable {
             remoteHead = newest.commit
             lastError = nil
             // Build ids, not commits: the builder may build a commit again with a new profile.
-            let signature = wanted.map(\.id.uuidString).sorted().joined(separator: ",")
-            let isNew = signature != config.lastRemoteBuild
+            // Each platform is followed by itself, because the builder publishes them minutes apart.
+            let tried = Set((config.lastRemoteBuild ?? "").split(separator: ",").map(String.init))
+            let fresh = wanted.filter { !tried.contains($0.id.uuidString) }
+            let isNew = !fresh.isEmpty
             guard force || isNew, runTask == nil else { return }
             log = log.keepingRuns(config.keptRuns - 1)
             history?.replaceLog(with: log)
@@ -426,11 +436,15 @@ final class PipelineRunner: Identifiable {
                 // The others already run these builds. Builds they don't have yet go to everyone.
                 if !isNew, newest.commit == config.lastDeployedCommit { snapshot.devices = [newDevice] }
                 append(.step, "Installing \(newest.commit.shortSHA) on new device \(newDevice.name)", startsRun: true)
+            } else if force {
+                append(.step, "Installing \(newest.commit.shortSHA) on request", startsRun: true)
             } else {
-                append(.step, isNew ? "New build on \(catalog.builder): \(newest.commit.shortSHA)"
-                                    : "Installing \(newest.commit.shortSHA) on request", startsRun: true)
+                // Only the platforms with a new build; the others already run theirs.
+                let platforms = Set(fresh.map(\.platform))
+                snapshot.devices = config.devices.filter { platforms.contains($0.platform) }
+                append(.step, "New build on \(catalog.builder): \((fresh.first ?? newest).commit.shortSHA)", startsRun: true)
             }
-            config.lastRemoteBuild = signature
+            config.lastRemoteBuild = wanted.map(\.id.uuidString).sorted().joined(separator: ",")
 
             let task = Task {
                 await self.runRemote(builds(for: snapshot.devices), from: builder, pipeline: remoteID, config: snapshot)

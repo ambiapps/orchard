@@ -33,6 +33,8 @@ final class AppStore {
             guard sharesBuilds != oldValue else { return }
             defaults?.set(sharesBuilds, forKey: sharesBuildsKey)
             pipelines.forEach { $0.sharesBuilds = sharesBuilds }
+            // Clients must not keep getting builds this Mac no longer means to share.
+            if !sharesBuilds, discoversDevices { SharedBuilds.removeAll() }
             updateServer()
             updateActivity()
         }
@@ -56,8 +58,11 @@ final class AppStore {
         didSet {
             guard builderLink != oldValue else { return }
             defaults?.set(builderLink, forKey: builderLinkKey)
+            // Nothing changes while the link is edited without becoming another builder's.
+            let link = BuilderLink(builderLink)
+            guard link != BuilderLink(oldValue) || link == nil else { return }
             // Pipelines removed here come back when the link is entered again.
-            knownRemotePipelines = []
+            if link?.baseURL != BuilderLink(oldValue)?.baseURL { knownRemotePipelines = [] }
             updateBuilder()
         }
     }
@@ -167,14 +172,22 @@ final class AppStore {
         let service = BuildService(name: Host.current().localizedName ?? "Builder", token: sharingToken,
                                    deviceSupport: DeviceSupport.package())
         serverTask = Task { [weak self] in
-            do {
-                let server = try BuildServer(service: service, port: BuilderLink.defaultPort)
-                try await server.start()
-                guard let self, !Task.isCancelled, self.sharesBuilds else { return server.stop() }
-                self.server = server
-            } catch {
-                guard !Task.isCancelled else { return }
-                self?.sharingError = "Couldn't listen on port \(BuilderLink.defaultPort): \(error.localizedDescription)"
+            // The port of a server that was just stopped takes a moment to come free, so a
+            // quick off-and-on tries a few times before giving up.
+            for attempt in 1...5 {
+                do {
+                    let server = try BuildServer(service: service, port: BuilderLink.defaultPort)
+                    try await server.start()
+                    guard let self, !Task.isCancelled, self.sharesBuilds else { return server.stop() }
+                    self.server = server
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    if attempt == 5 {
+                        self?.sharingError = "Couldn't listen on port \(BuilderLink.defaultPort): \(error.localizedDescription)"
+                    }
+                    try? await Task.sleep(for: .seconds(1))
+                }
             }
         }
     }

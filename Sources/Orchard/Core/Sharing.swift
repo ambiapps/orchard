@@ -60,8 +60,9 @@ struct BuilderLink: Equatable, Sendable {
     }
 }
 
-/// The shared builds on disk: `Pipelines/<id>/Shared/<platform>.zip` with a `<platform>.json`
-/// next to it. The server reads these files and nothing else, so a build that's being replaced
+/// The shared builds on disk: `Pipelines/<id>/Shared/<build id>.zip`, described by a
+/// `<platform>.json` next to it. An archive is named after its build, so a request for a build
+/// can never get another one's archive. The server reads these files and nothing else, so a build that's being replaced
 /// in DerivedData is never what a client downloads.
 enum SharedBuilds {
     private struct Entry: Codable {
@@ -80,26 +81,51 @@ enum SharedBuilds {
         let directory = directory(pipeline: pipeline.id, root: root)
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
-        let zip = directory.appendingPathComponent("\(platform.rawValue).zip")
         let json = directory.appendingPathComponent("\(platform.rawValue).json")
-        let staging = directory.appendingPathComponent("\(platform.rawValue).zip.new")
-        try? fm.removeItem(at: staging)
-        try await Shell.run("/usr/bin/ditto", ["-c", "-k", "--keepParent", product.appURL.path, staging.path])
-
+        let previous = (try? JSONDecoder().decode(Entry.self, from: Data(contentsOf: json)))?.build
         var build = SharedBuild(platform: platform, commit: commit, subject: subject,
                                 bundleIdentifier: product.bundleIdentifier)
+        let staging = directory.appendingPathComponent("\(build.id.uuidString).zip.new")
+        do {
+            try await Shell.run("/usr/bin/ditto", ["-c", "-k", "--keepParent", product.appURL.path, staging.path])
+        } catch {
+            try? fm.removeItem(at: staging)
+            throw error
+        }
         build.size = (try? fm.attributesOfItem(atPath: staging.path)[.size] as? Int64) ?? 0
-        // Without its description the old build is gone for clients, so none of them gets the
-        // new archive under the old build's id.
-        try? fm.removeItem(at: json)
-        try? fm.removeItem(at: zip)
-        try fm.moveItem(at: staging, to: zip)
+        try fm.moveItem(at: staging, to: archiveURL(build.id, in: directory))
         try JSONEncoder().encode(Entry(pipeline: pipeline.name, build: build)).write(to: json, options: .atomic)
+        // A download of the old archive that's under way keeps its open file.
+        if let previous { try? fm.removeItem(at: archiveURL(previous.id, in: directory)) }
         return build
     }
 
-    static func remove(pipeline id: UUID, root: URL = Paths.pipelines) {
-        try? FileManager.default.removeItem(at: directory(pipeline: id, root: root))
+    private static func archiveURL(_ build: UUID, in directory: URL) -> URL {
+        directory.appendingPathComponent("\(build.uuidString).zip")
+    }
+
+    /// Stops sharing a pipeline's builds, or only those of platforms not in `keeping`.
+    static func remove(pipeline id: UUID, keeping: Set<BuildPlatform> = [], root: URL = Paths.pipelines) {
+        let fm = FileManager.default
+        let directory = directory(pipeline: id, root: root)
+        guard !keeping.isEmpty else {
+            try? fm.removeItem(at: directory)
+            return
+        }
+        for json in (try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? []
+        where json.pathExtension == "json" {
+            guard let entry = try? JSONDecoder().decode(Entry.self, from: Data(contentsOf: json)),
+                  !keeping.contains(entry.build.platform) else { continue }
+            try? fm.removeItem(at: json)
+            try? fm.removeItem(at: archiveURL(entry.build.id, in: directory))
+        }
+    }
+
+    /// Stops sharing every pipeline's builds.
+    static func removeAll(root: URL = Paths.pipelines) {
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] {
+            if let id = UUID(uuidString: name) { remove(pipeline: id, root: root) }
+        }
     }
 
     static func catalog(root: URL = Paths.pipelines) -> [SharedPipeline] {
@@ -117,11 +143,10 @@ enum SharedBuilds {
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    /// The archive of `build`, if it's still the pipeline's current one.
+    /// The archive of `build`, if it's still one the pipeline shares.
     static func archive(pipeline id: UUID, build: UUID, root: URL = Paths.pipelines) -> URL? {
-        guard let shared = catalog(root: root).first(where: { $0.id == id })?.builds.first(where: { $0.id == build })
-        else { return nil }
-        return directory(pipeline: id, root: root).appendingPathComponent("\(shared.platform.rawValue).zip")
+        let archive = archiveURL(build, in: directory(pipeline: id, root: root))
+        return FileManager.default.fileExists(atPath: archive.path) ? archive : nil
     }
 
     /// Unpacks a downloaded archive into `directory` (replacing what's there) and returns its app.
@@ -169,9 +194,18 @@ struct BuilderClient: Equatable, Sendable {
     func catalog() async throws -> BuildCatalog {
         var request = request("v1/builds")
         request.timeoutInterval = 20
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.cancellable { try await URLSession.shared.data(for: request) }
         try check(response)
         return try JSONDecoder().decode(BuildCatalog.self, from: data)
+    }
+
+    /// URLSession reports a cancelled task as `URLError.cancelled`; callers expect `CancellationError`.
+    private static func cancellable<T>(_ load: () async throws -> T) async throws -> T {
+        do {
+            return try await load()
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
+        }
     }
 
     /// Downloads `build`'s archive to `file`.
@@ -184,7 +218,8 @@ struct BuilderClient: Equatable, Sendable {
     }
 
     private func download(_ path: String, to file: URL) async throws {
-        let (temporary, response) = try await URLSession.shared.download(for: request(path))
+        let request = request(path)
+        let (temporary, response) = try await Self.cancellable { try await URLSession.shared.download(for: request) }
         try check(response)
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
