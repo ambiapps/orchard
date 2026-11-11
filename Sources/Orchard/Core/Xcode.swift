@@ -125,10 +125,14 @@ enum Xcode {
         let apps = (try? FileManager.default.contentsOfDirectory(at: products, includingPropertiesForKeys: nil))?
             .filter { $0.pathExtension == "app" && (signingDate(of: $0).map { $0 >= date } ?? false) } ?? []
         guard apps.count == 1, let app = apps.first else { return nil }
+        guard let bundleID = bundleIdentifier(of: app) else { return nil }
+        return BuiltProduct(appURL: app, bundleIdentifier: bundleID)
+    }
+
+    static func bundleIdentifier(of app: URL) -> String? {
         let info = ["Contents/Info.plist", "Info.plist"].lazy
             .compactMap { NSDictionary(contentsOf: app.appendingPathComponent($0)) }.first
-        guard let bundleID = info?["CFBundleIdentifier"] as? String else { return nil }
-        return BuiltProduct(appURL: app, bundleIdentifier: bundleID)
+        return info?["CFBundleIdentifier"] as? String
     }
 
     private static func signingDate(of app: URL) -> Date? {

@@ -16,7 +16,8 @@ struct PipelineDetailView: View {
                     if runner.status.isBusy && runner.status != .checking {
                         Button("Cancel", systemImage: "stop.fill") { runner.cancelRun() }
                     } else {
-                        Button("Build & Deploy Now", systemImage: "hammer") { runner.buildNow() }
+                        Button(runner.config.isRemote ? "Install Now" : "Build & Deploy Now",
+                               systemImage: runner.config.isRemote ? "arrow.down.circle" : "hammer") { runner.buildNow() }
                             .disabled(runner.config.missingSetup != nil || runner.status.isBusy)
                     }
                     Toggle(isOn: $runner.config.isEnabled) {
@@ -26,7 +27,9 @@ struct PipelineDetailView: View {
                     .toggleStyle(.button)
                     .tint(runner.config.isEnabled ? .green : nil)
                     .disabled(runner.config.missingSetup != nil && !runner.config.isEnabled)
-                    .help(runner.config.missingSetup ?? "Poll the branch and deploy every new commit")
+                    .help(runner.config.missingSetup ?? (runner.config.isRemote
+                        ? "Ask the builder for new builds and install each one"
+                        : "Poll the branch and deploy every new commit"))
                 }
             }
     }
@@ -52,6 +55,64 @@ struct PipelineSettingsView: View {
                 TextField("Name", text: $runner.config.name)
             }
 
+            if runner.config.isRemote {
+                Section("Source") {
+                    LabeledContent("Builder", value: builderName)
+                    if let head = runner.remoteHead {
+                        LabeledContent("Latest build", value: head.shortSHA).monospaced()
+                    }
+                }
+            } else {
+                localSections
+            }
+
+            DevicesSection(runner: runner)
+
+            Section(runner.config.isRemote ? "Updates" : "Polling") {
+                Picker("Check every", selection: $runner.config.pollInterval) {
+                    ForEach([30.0, 60, 120, 300, 900], id: \.self) { seconds in
+                        Text(seconds < 60 ? "\(Int(seconds)) seconds" : "\(Int(seconds / 60)) minute\(seconds == 60 ? "" : "s")")
+                            .tag(seconds)
+                    }
+                }
+                Picker("Keep history of", selection: Binding(
+                    get: { runner.config.keptRuns },
+                    set: { runner.config.historyLimit = $0 })) {
+                    ForEach([5, 10, 20, 50], id: \.self) { Text("Last \($0) builds").tag($0) }
+                }
+                if let commit = runner.config.lastDeployedCommit {
+                    LabeledContent("Last deployed") {
+                        HStack(spacing: 4) {
+                            Text(commit.shortSHA).monospaced()
+                            if let date = runner.config.lastDeployedAt {
+                                Text(date, style: .relative) + Text(" ago")
+                            }
+                        }
+                    }
+                }
+                if let head = runner.remoteHead, !runner.config.isRemote {
+                    LabeledContent("Branch head", value: head.shortSHA).monospaced()
+                }
+                if let error = runner.lastError {
+                    Text(error).foregroundStyle(.orange).font(.callout)
+                }
+            }
+        }
+        .formStyle(.grouped)
+        .navigationTitle(runner.config.name)
+        .navigationSubtitle(runner.status.label)
+        .task(id: runner.config.repoPath) { await loadRepository() }
+        .task(id: [runner.config.repoPath, runner.config.containerPath].compactMap { $0 }) { await loadSchemes() }
+    }
+
+    private var builderName: String {
+        if case .connected(let name, _) = store.builderStatus { return name }
+        return store.builder?.link.baseURL.host() ?? "None"
+    }
+
+    /// The sections of a pipeline that builds a repository on this Mac.
+    @ViewBuilder
+    private var localSections: some View {
             Section("Source") {
                 LabeledContent("Repository") {
                     HStack {
@@ -99,45 +160,16 @@ struct PipelineSettingsView: View {
                 Picker("Configuration", selection: $runner.config.configuration) {
                     ForEach(options(["Debug", "Release"], keeping: runner.config.configuration), id: \.self) { Text($0) }
                 }
-            }
-
-            DevicesSection(runner: runner)
-
-            Section("Polling") {
-                Picker("Check every", selection: $runner.config.pollInterval) {
-                    ForEach([30.0, 60, 120, 300, 900], id: \.self) { seconds in
-                        Text(seconds < 60 ? "\(Int(seconds)) seconds" : "\(Int(seconds / 60)) minute\(seconds == 60 ? "" : "s")")
-                            .tag(seconds)
-                    }
-                }
-                Picker("Keep history of", selection: Binding(
-                    get: { runner.config.keptRuns },
-                    set: { runner.config.historyLimit = $0 })) {
-                    ForEach([5, 10, 20, 50], id: \.self) { Text("Last \($0) builds").tag($0) }
-                }
-                if let commit = runner.config.lastDeployedCommit {
-                    LabeledContent("Last deployed") {
-                        HStack(spacing: 4) {
-                            Text(commit.shortSHA).monospaced()
-                            if let date = runner.config.lastDeployedAt {
-                                Text(date, style: .relative) + Text(" ago")
-                            }
+                if store.sharesBuilds {
+                    Picker("Also build for", selection: $runner.config.alsoBuilds) {
+                        Text("Chosen devices only").tag(BuildPlatform?.none)
+                        ForEach(BuildPlatform.allCases.filter { !$0.isSimulator }, id: \.self) {
+                            Text($0.displayName).tag(BuildPlatform?.some($0))
                         }
                     }
-                }
-                if let head = runner.remoteHead {
-                    LabeledContent("Branch head", value: head.shortSHA).monospaced()
-                }
-                if let error = runner.lastError {
-                    Text(error).foregroundStyle(.orange).font(.callout)
+                    .help("Build this platform for clients even when none of this Mac's devices needs it")
                 }
             }
-        }
-        .formStyle(.grouped)
-        .navigationTitle(runner.config.name)
-        .navigationSubtitle(runner.status.label)
-        .task(id: runner.config.repoPath) { await loadRepository() }
-        .task(id: [runner.config.repoPath, runner.config.containerPath].compactMap { $0 }) { await loadSchemes() }
     }
 
     /// Keeps a stored selection visible even if it's not (yet) in the loaded list.
@@ -227,6 +259,23 @@ private struct DevicesSection: View {
                 // Not selectable until it's paired; automatic setup adds it when it's ready.
                 .disabled(row.onboarding != nil && !isSelected(row.device))
             }
+            if store.deviceSupport != .installed {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Label("Device support isn't installed", systemImage: "exclamationmark.triangle")
+                        Spacer()
+                        if store.deviceSupport == .installing {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Install…") { store.installDeviceSupport() }
+                                .disabled(!store.builderHasDeviceSupport)
+                        }
+                    }
+                    Text(deviceSupportHint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             if store.setsUpDevicesAutomatically {
                 Toggle("Deploy to new devices", isOn: Binding(
                     get: { runner.config.addsNewDevices },
@@ -249,7 +298,9 @@ private struct DevicesSection: View {
         } footer: {
             Text(store.setsUpDevicesAutomatically
                  ? "Paired devices and booted simulators. Devices of the same platform share one build. A device plugged into this Mac is set up automatically, and added here if this pipeline deploys to new devices."
-                 : "Paired devices from Xcode and booted simulators. Devices of the same platform share one build.")
+                 : store.hasXcode
+                    ? "Paired devices from Xcode and booted simulators. Devices of the same platform share one build."
+                    : "Devices paired with this Mac. To pair one, turn on “Set up connected devices automatically” in Settings and plug it in.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -258,6 +309,13 @@ private struct DevicesSection: View {
     /// Discovered devices, plus selected ones that aren't currently visible: enabled ones first, then available ones.
     private var rows: [DiscoveredDevice] {
         DeviceDiscovery.listRows(discovered: store.devices, selected: runner.config.devices)
+    }
+
+    private var deviceSupportHint: String {
+        if case .failed(let reason) = store.deviceSupport { return reason }
+        return store.builderHasDeviceSupport
+            ? "This Mac has no Xcode. Orchard can install Apple's device support (about 150 MB) from the builder instead; it asks for an administrator password."
+            : "Orchard needs it to find and install on iPhones and other devices. Add a builder link in Settings to install it from the builder, or install Xcode."
     }
 
     private func detail(for row: DiscoveredDevice) -> String {

@@ -9,12 +9,12 @@ enum Deployer {
         case .thisMac:
             try await deployToThisMac(product, log: log)
         case .physical:
-            try await Shell.xcrun(
-                ["devicectl", "device", "install", "app", "--device", device.id, product.appURL.path],
+            try await Shell.devicectl(
+                ["device", "install", "app", "--device", device.id, product.appURL.path],
                 onLine: log)
             try await launching {
-                try await Shell.xcrun(
-                    ["devicectl", "device", "process", "launch", "--device", device.id,
+                try await Shell.devicectl(
+                    ["device", "process", "launch", "--device", device.id,
                      "--terminate-existing", product.bundleIdentifier],
                     onLine: log)
             }

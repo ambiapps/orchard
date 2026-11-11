@@ -12,6 +12,8 @@ final class PipelineRunner: Identifiable {
         case checking
         case preparing
         case building(BuildPlatform)
+        /// A client fetching the build from its builder.
+        case downloading(BuildPlatform)
         /// Names of the devices still being deployed to; they're deployed to at the same time.
         case deploying([String])
 
@@ -29,6 +31,7 @@ final class PipelineRunner: Identifiable {
             case .checking: "Checking for changes…"
             case .preparing: "Checking out…"
             case .building(let platform): "Building for \(platform.displayName)…"
+            case .downloading(let platform): "Downloading the \(platform.displayName) build…"
             case .deploying(let devices):
                 devices.count == 1 ? "Deploying to \(devices[0])…" : "Deploying to \(devices.count) devices…"
             }
@@ -64,6 +67,11 @@ final class PipelineRunner: Identifiable {
     /// Devices that automatic setup just added and that still need their first deploy.
     @ObservationIgnored private var newDevices: [Device] = []
     @ObservationIgnored private let deployer: DeployAction
+    /// Whether this Mac is a builder: each build is then also zipped for its clients. Set by `AppStore`.
+    @ObservationIgnored var sharesBuilds = false
+    /// The builder a remote pipeline (`config.remoteID`) gets its builds from. Set by `AppStore`.
+    @ObservationIgnored var builder: BuilderClient?
+    @ObservationIgnored private let sharedRoot: URL
 
     /// Installs and launches an app on a device, logging the tools' output line by line.
     typealias DeployAction = @Sendable (BuiltProduct, Device, @escaping @Sendable (String) -> Void) async throws -> Void
@@ -75,10 +83,12 @@ final class PipelineRunner: Identifiable {
 
     /// `history` keeps deploys and the log across launches; without it they live only in memory.
     /// Tests replace `deployer`, which otherwise needs real devices.
-    init(config: PipelineConfig, history: PipelineHistory? = nil,
+    /// `sharedRoot` is where a builder keeps the builds it shares, and a client its downloads.
+    init(config: PipelineConfig, history: PipelineHistory? = nil, sharedRoot: URL = Paths.pipelines,
          deployer: @escaping DeployAction = { try await Deployer.deploy($0, to: $1, log: $2) }) {
         self._id = config.id
         self.deployer = deployer
+        self.sharedRoot = sharedRoot
         self.config = config
         // Before `history` is set, so loading doesn't trigger a save (which would wipe a file
         // that failed to decode).
@@ -95,7 +105,9 @@ final class PipelineRunner: Identifiable {
     private func start() {
         guard loopTask == nil else { return }
         status = .idle
-        append(.info, "Enabled — polling \(config.branch ?? "?") every \(Int(config.pollInterval))s")
+        append(.info, config.isRemote
+               ? "Enabled — asking the builder for new builds every \(Int(config.pollInterval))s"
+               : "Enabled — polling \(config.branch ?? "?") every \(Int(config.pollInterval))s")
         Notifier.requestAuthorization()
         loopTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -155,10 +167,14 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Polling
 
-    private func check(force: Bool, newDevice: Device? = nil) async {
+    func check(force: Bool, newDevice: Device? = nil) async {
         guard runTask == nil else { return }
         if let missing = config.missingSetup {
             lastError = missing
+            return
+        }
+        if let remoteID = config.remoteID {
+            await checkRemote(remoteID, force: force, newDevice: newDevice)
             return
         }
         guard let repo = config.repoURL, let branch = config.branch else { return }
@@ -221,6 +237,7 @@ final class PipelineRunner: Identifiable {
         let dirs = Paths.pipeline(config.id)
         let runStart = Date()
         var timings = RunTimings()
+        var buildFailed = false
 
         do {
             status = .preparing
@@ -237,8 +254,10 @@ final class PipelineRunner: Identifiable {
             update { $0.timings = timings }
 
             let groups = Dictionary(grouping: config.devices, by: \.platform)
-            for platform in BuildPlatform.allCases {
-                guard var devices = groups[platform] else { continue }
+            // A builder also builds a platform none of its own devices needs, for its clients.
+            let platforms = sharesBuilds ? config.buildPlatforms : Set(groups.keys)
+            for platform in BuildPlatform.allCases where platforms.contains(platform) {
+                var devices = groups[platform] ?? []
                 try Task.checkCancellation()
 
                 /// Builds the platform; nil when the build failed, which fails its devices unless
@@ -263,6 +282,7 @@ final class PipelineRunner: Identifiable {
                         let elapsed = Date().timeIntervalSince(buildStart).formattedDuration
                         append(.error, "Build for \(platform.displayName) failed after \(elapsed)")
                         if failingDevices {
+                            buildFailed = true
                             for device in devices {
                                 update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
                             }
@@ -292,6 +312,7 @@ final class PipelineRunner: Identifiable {
                             if let rebuilt = try await buildProduct(failingDevices: false) {
                                 product = rebuilt
                             } else if !FileManager.default.fileExists(atPath: product.appURL.path) {
+                                buildFailed = true
                                 for device in devices {
                                     update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
                                 }
@@ -303,6 +324,20 @@ final class PipelineRunner: Identifiable {
                 }
                 update { $0.products = ($0.products ?? [:]).merging([platform.rawValue: product]) { $1 } }
 
+                if sharesBuilds, !platform.isSimulator {
+                    do {
+                        let shared = try await SharedBuilds.publish(
+                            product, platform: platform, commit: commit, subject: subject,
+                            pipeline: self.config, root: sharedRoot)
+                        append(.info, "Sharing the \(platform.displayName) build with clients (\(shared.size.formattedSize))")
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        append(.warning, "Couldn't share the \(platform.displayName) build: \(error.localizedDescription)")
+                    }
+                }
+                guard !devices.isEmpty else { continue }
+
                 try Task.checkCancellation()
                 let deployStart = Date()
                 defer {
@@ -312,27 +347,8 @@ final class PipelineRunner: Identifiable {
                 try await deployAll(product, to: devices, run: record.id, log: raw)
             }
 
-            let outcome = runs.first(where: { $0.id == record.id })?.finalOutcome(devices: config.devices)
-                ?? .succeeded
-            update { $0.outcome = outcome }
-            let took = timings.summary(total: Date().timeIntervalSince(runStart))
-            switch outcome {
-            case .failed(let summary):
-                append(.error, "\(summary) after \(took)")
-                Notifier.post(title: "\(config.name) failed", body: "\(commit.shortSHA): \(summary)")
-            case .warning(let summary):
-                // The build is on every device, so it counts as deployed.
-                self.config.lastDeployedCommit = commit
-                self.config.lastDeployedAt = Date()
-                append(.warning, "\(summary) after \(took)")
-                Notifier.post(title: "Installed \(config.name)", body: "\(commit.shortSHA): \(summary)")
-            default:
-                self.config.lastDeployedCommit = commit
-                self.config.lastDeployedAt = Date()
-                append(.success, "Deployed \(commit.shortSHA) to \(config.devices.count) device(s) in \(took)")
-                Notifier.post(title: "Deployed \(config.name)",
-                              body: "\(commit.shortSHA) is running on \(config.devices.count) device(s).")
-            }
+            conclude(record.id, commit: commit, config: config, buildFailed: buildFailed,
+                     took: timings.summary(total: Date().timeIntervalSince(runStart)))
         } catch is CancellationError {
             update {
                 $0.outcome = .failed("Cancelled")
@@ -341,6 +357,166 @@ final class PipelineRunner: Identifiable {
             append(.warning, "Cancelled after \(Date().timeIntervalSince(runStart).formattedDuration)")
         } catch {
             update { $0.outcome = .failed(error.localizedDescription) }
+            append(.error, "\(error.localizedDescription) (after \(Date().timeIntervalSince(runStart).formattedDuration))")
+            Notifier.post(title: "\(config.name) failed", body: error.localizedDescription)
+        }
+        update { $0.finishedAt = Date() }
+        logFile.close()
+    }
+
+    /// Sets a finished run's outcome from its devices', logs it and notifies.
+    private func conclude(_ id: RunRecord.ID, commit: String, config: PipelineConfig,
+                          buildFailed: Bool = false, took: String) {
+        var outcome = runs.first(where: { $0.id == id })?.finalOutcome(devices: config.devices) ?? .succeeded
+        // With no device of its own (a builder that only shares), a failed build fails nothing else.
+        if buildFailed, outcome == .succeeded { outcome = .failed("Build failed") }
+        if let index = runs.firstIndex(where: { $0.id == id }) { runs[index].outcome = outcome }
+        switch outcome {
+        case .failed(let summary):
+            append(.error, "\(summary) after \(took)")
+            Notifier.post(title: "\(config.name) failed", body: "\(commit.shortSHA): \(summary)")
+        case .warning(let summary):
+            // The build is on every device, so it counts as deployed.
+            self.config.lastDeployedCommit = commit
+            self.config.lastDeployedAt = Date()
+            append(.warning, "\(summary) after \(took)")
+            Notifier.post(title: "Installed \(config.name)", body: "\(commit.shortSHA): \(summary)")
+        default:
+            self.config.lastDeployedCommit = commit
+            self.config.lastDeployedAt = Date()
+            if config.devices.isEmpty {
+                append(.success, "Built \(commit.shortSHA) for clients in \(took)")
+            } else {
+                append(.success, "Deployed \(commit.shortSHA) to \(config.devices.count) device(s) in \(took)")
+                Notifier.post(title: "Deployed \(config.name)",
+                              body: "\(commit.shortSHA) is running on \(config.devices.count) device(s).")
+            }
+        }
+    }
+
+    // MARK: Builds from a builder
+
+    /// A client's check: asks the builder for its newest builds and installs the ones this
+    /// pipeline's devices don't have yet.
+    private func checkRemote(_ remoteID: UUID, force: Bool, newDevice: Device?) async {
+        status = .checking
+        defer { status = config.isEnabled ? .idle : .disabled }
+        do {
+            guard let builder else { throw BuilderError.notConnected }
+            let catalog = try await builder.catalog()
+            lastCheck = Date()
+            guard let shared = catalog.pipelines.first(where: { $0.id == remoteID }) else { throw BuilderError.notShared }
+            func builds(for devices: [Device]) -> [SharedBuild] {
+                let platforms = Set(devices.map(\.platform))
+                return shared.builds.filter { platforms.contains($0.platform) }.sorted { $0.builtAt > $1.builtAt }
+            }
+            let wanted = builds(for: config.devices)
+            guard let newest = wanted.first else { throw BuilderError.noBuild }
+            remoteHead = newest.commit
+            lastError = nil
+            // Build ids, not commits: the builder may build a commit again with a new profile.
+            let signature = wanted.map(\.id.uuidString).sorted().joined(separator: ",")
+            let isNew = signature != config.lastRemoteBuild
+            guard force || isNew, runTask == nil else { return }
+            log = log.keepingRuns(config.keptRuns - 1)
+            history?.replaceLog(with: log)
+            var snapshot = config
+            if let newDevice {
+                newDevices.removeAll { $0.id == newDevice.id }
+                // The others already run these builds. Builds they don't have yet go to everyone.
+                if !isNew, newest.commit == config.lastDeployedCommit { snapshot.devices = [newDevice] }
+                append(.step, "Installing \(newest.commit.shortSHA) on new device \(newDevice.name)", startsRun: true)
+            } else {
+                append(.step, isNew ? "New build on \(catalog.builder): \(newest.commit.shortSHA)"
+                                    : "Installing \(newest.commit.shortSHA) on request", startsRun: true)
+            }
+            config.lastRemoteBuild = signature
+
+            let task = Task {
+                await self.runRemote(builds(for: snapshot.devices), from: builder, pipeline: remoteID, config: snapshot)
+            }
+            runTask = task
+            await task.value
+            runTask = nil
+        } catch is CancellationError {
+        } catch {
+            lastCheck = Date()
+            // The same answer on every poll (no build yet, builder asleep) is logged once.
+            if lastError != error.localizedDescription {
+                append(.error, "Couldn't get builds: \(error.localizedDescription)")
+            }
+            lastError = error.localizedDescription
+        }
+    }
+
+    /// Downloads each platform's build and deploys it to that platform's devices. `builds` are
+    /// newest first, one per platform.
+    private func runRemote(_ builds: [SharedBuild], from builder: BuilderClient, pipeline remoteID: UUID,
+                           config: PipelineConfig) async {
+        guard let newest = builds.first else { return }
+        self.config.lastAttemptedCommit = newest.commit
+        let logFile = LogFile(pipeline: config, commit: newest.commit)
+        var record = RunRecord(commit: newest.commit, subject: newest.subject,
+                               baseCommit: config.lastDeployedCommit, logFile: logFile.url)
+        for device in config.devices { record.deviceOutcomes[device.id] = .pending }
+        runs.insert(record, at: 0)
+        if runs.count > config.keptRuns { runs.removeLast(runs.count - config.keptRuns) }
+
+        func update(_ change: (inout RunRecord) -> Void) {
+            guard let index = runs.firstIndex(where: { $0.id == record.id }) else { return }
+            change(&runs[index])
+        }
+        let raw = logger(file: logFile, condensed: false)
+        let downloads = Paths.PipelineDirs(root: sharedRoot.appendingPathComponent(config.id.uuidString)).downloads
+        let runStart = Date()
+        var timings = RunTimings()
+        if let subject = newest.subject { append(.info, "“\(subject)”") }
+
+        do {
+            for build in builds {
+                try Task.checkCancellation()
+                let platform = build.platform
+                var devices = config.devices.filter { $0.platform == platform }
+                status = .downloading(platform)
+                // The download replaces the app an older run could still be deployed from.
+                runs.forgetProducts(keeping: record.id)
+                append(.step, "Downloading \(build.commit.shortSHA) for \(platform.displayName) (\(build.size.formattedSize))")
+                let downloadStart = Date()
+                let archive = downloads.appendingPathComponent("\(platform.rawValue).zip")
+                try await builder.download(build, pipeline: remoteID, to: archive)
+                let product = try await SharedBuilds.unpack(
+                    archive, into: downloads.appendingPathComponent(platform.rawValue, isDirectory: true))
+                try? FileManager.default.removeItem(at: archive)
+                timings.download = (timings.download ?? 0) + Date().timeIntervalSince(downloadStart)
+                update {
+                    $0.timings = timings
+                    $0.products = ($0.products ?? [:]).merging([platform.rawValue: product]) { $1 }
+                }
+
+                if platform.needsDeviceProvisioning { devices = await rememberingUDIDs(of: devices) }
+                try Task.checkCancellation()
+                let deployStart = Date()
+                defer {
+                    timings.deploy += Date().timeIntervalSince(deployStart)
+                    update { $0.timings = timings }
+                }
+                try await deployAll(product, to: devices, run: record.id, log: raw)
+            }
+            // A platform the builder has no build for.
+            update { $0.markUnfinishedDevices(.failed("The builder has no build for this device")) }
+            conclude(record.id, commit: newest.commit, config: config,
+                     took: timings.summary(total: Date().timeIntervalSince(runStart)))
+        } catch is CancellationError {
+            update {
+                $0.outcome = .failed("Cancelled")
+                $0.markUnfinishedDevices(.failed("Cancelled"))
+            }
+            append(.warning, "Cancelled after \(Date().timeIntervalSince(runStart).formattedDuration)")
+        } catch {
+            update {
+                $0.outcome = .failed(error.localizedDescription)
+                $0.markUnfinishedDevices(.failed("Download failed"))
+            }
             append(.error, "\(error.localizedDescription) (after \(Date().timeIntervalSince(runStart).formattedDuration))")
             Notifier.post(title: "\(config.name) failed", body: error.localizedDescription)
         }
@@ -531,6 +707,8 @@ enum Paths {
         return base.appendingPathComponent("Orchard", isDirectory: true)
     }()
 
+    static let pipelines = appSupport.appendingPathComponent("Pipelines", isDirectory: true)
+
     static let logs: URL = {
         let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
         return base.appendingPathComponent("Logs/Orchard", isDirectory: true)
@@ -540,10 +718,12 @@ enum Paths {
         var root: URL
         var checkout: URL { root.appendingPathComponent("checkout", isDirectory: true) }
         var derivedData: URL { root.appendingPathComponent("DerivedData", isDirectory: true) }
+        /// Builds a client downloaded from its builder, one folder per platform.
+        var downloads: URL { root.appendingPathComponent("Downloads", isDirectory: true) }
     }
 
     static func pipeline(_ id: UUID) -> PipelineDirs {
-        PipelineDirs(root: appSupport.appendingPathComponent("Pipelines/\(id.uuidString)", isDirectory: true))
+        PipelineDirs(root: pipelines.appendingPathComponent(id.uuidString, isDirectory: true))
     }
 }
 

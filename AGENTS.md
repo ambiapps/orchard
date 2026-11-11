@@ -6,7 +6,7 @@ Guide for AI coding agents working on this repo. All of the code here is written
 
 A macOS menu bar + window app (SwiftUI, macOS 15+) for iOS/macOS developers. You point it at a local git clone, a branch, an Xcode scheme and a set of devices. While a pipeline is enabled, Orchard polls the branch and, whenever its head commit changes, builds the app and installs + launches it on every chosen device: this Mac, paired physical iPhones/iPads/Apple TVs/Apple Watches/Vision Pros, and booted simulators. It's like a tiny local CD server for your own devices.
 
-It shells out to the developer's own tools: `git`, `xcodebuild`, `xcrun devicectl` (physical devices) and `xcrun simctl` (simulators). There's no server; its only network code is `Updater`, which asks the GitHub API for the latest release and downloads its DMG.
+It shells out to the developer's own tools: `git`, `xcodebuild`, `xcrun devicectl` (physical devices) and `xcrun simctl` (simulators). Its network code is `Updater`, which asks the GitHub API for the latest release and downloads its DMG, and the opt-in builder/client pair (`BuildServer`, `BuilderClient`), with which one Mac serves its builds to others.
 
 ## Layout
 
@@ -27,6 +27,12 @@ Sources/Orchard/
                               step function, the devicectl commands, DeviceLog (devices.log)
     Provisioning.swift        Reads the provisioning profiles embedded in a built app, checks them for the
                               chosen devices' UDIDs, and deletes Xcode's cached managed profiles
+    Sharing.swift             Builder/client: SharedBuild, BuilderLink, SharedBuilds (the zips a builder keeps),
+                              BuilderClient (catalog + downloads), BuilderError
+    BuildServer.swift         The builder's HTTP server (Network.framework): HTTPRequest parsing, BuildService
+                              (routing + token check), BuildServer (listener, file streaming)
+    DeviceSupport.swift       Where devicectl comes from (Xcode, or the standalone copy on a client without
+                              Xcode), the package a builder hands out, installing it; Shell.devicectl
     Shell.swift               Async Process wrapper with login-shell PATH and line streaming. All commands go through it
     Updater.swift             AppVersion (tag/bundle parsing, comparison), GitHub latest-release check, the
                               "Update Available" NSAlert, self-update (download DMG → stage app → swap script)
@@ -37,7 +43,7 @@ Sources/Orchard/
                               and the detail column's toolbar
     ActivityView.swift        Run history and live log
     UpdateAvailableView.swift The "Update Available" window (SwiftUI in a small non-modal NSWindow)
-    SettingsView.swift        The Settings window: "Set up connected devices automatically"
+    SettingsView.swift        The Settings window: "Set up connected devices automatically", Builder, Client
 Tests/OrchardTests/           Swift Testing (`import Testing`, `@Test`, `#expect`) unit tests
 Resources/AppIcon.icon/       Liquid Glass app icon (Icon Composer document: icon.json + SVG layers)
 VERSION                       Marketing version (CFBundleShortVersionString); every PR bumps its patch digit
@@ -71,6 +77,15 @@ Opt-in (`AppStore.setsUpDevicesAutomatically`, UserDefaults key `setsUpDevicesAu
 
 `devicectl`'s JSON is read from its `properties` dictionary, falling back to the deprecated `connectionProperties`/`deviceProperties`/`hardwareProperties`. `connection.state` is `connected`, `disconnected` (reachable, tunnel down; devicectl connects on demand) or `unavailable`; `transportType` is `wired` or `localNetwork`.
 
+## Builder and clients
+
+Both are opt-in and independent (a Mac can be both). With neither on, Orchard opens no port and contacts no other Mac.
+
+- **Builder** (`AppStore.sharesBuilds`, defaults key `sharesBuilds`): after each successful build of a non-simulator platform, `PipelineRunner.run` calls `SharedBuilds.publish`, which zips the app (`ditto`) to `Pipelines/<id>/Shared/<platform>.zip` with a `<platform>.json` (`SharedBuild`, with a new `id` per build). `BuildServer` listens on `BuilderLink.defaultPort` (8642) and serves only those files: `GET /v1/builds` (`BuildCatalog`), `GET /v1/builds/<pipeline>/<build id>.zip`, `GET /v1/device-support.pkg`. Every request needs `Authorization: Bearer <token>` (`sharingToken` in defaults). It never serves from DerivedData, which the next build overwrites. `PipelineConfig.alsoBuilds` adds a platform no local device needs; a pipeline may then have no devices at all, so a failed build must fail the run itself (`conclude(buildFailed:)`).
+- **Client** (`AppStore.builderLink`, defaults key `builderLink`, the string `http://host:port/#token`): `AppStore.sync(with:)` adds a disabled pipeline with `PipelineConfig.remoteID` for each pipeline the builder shares, once (`knownBuilderPipelines`; cleared when the link changes). Such a pipeline has no repo: `PipelineRunner.check` goes to `checkRemote`, which compares the build ids of its devices' platforms with `lastRemoteBuild` (ids, not commits: the builder rebuilds a commit when a profile changes) and `runRemote` downloads, unpacks to `Pipelines/<id>/Downloads/<platform>/` and deploys through the same `deployAll` as a local run, so history, redeploy and the provisioning check work unchanged.
+- **No Xcode on a client.** `/usr/bin/xcrun` and `/usr/bin/git` are stubs there that pop up "install developer tools", so never call them without checking: `devicectl` goes through `Shell.devicectl` (Xcode's when there is one, else `DeviceSupport.standalonePath`), and simulators are only listed when `DeviceSupport.hasXcode`. The standalone `devicectl` is installed by `XcodeSystemResources.pkg`, which the builder serves from its own Xcode and the client installs with `installer` as root, only if `pkgutil --check-signature` says "signed Apple Software". Not verified on a Mac that never had Xcode: no such Mac was available.
+- The wire format (`/v1/…`, `BuildCatalog`, `SharedBuild`) is shared between Orchard versions on different Macs. Add optional fields; don't rename or remove.
+
 ## Build, run, test
 
 ```bash
@@ -84,9 +99,9 @@ You can also open `Package.swift` in Xcode. `swift run` works too: `AppDelegate`
 
 ## Tests
 
-- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`, `PipelineHistoryTests`, `DeviceDiscoveryTests`, `DeviceOnboardingTests`, `ProvisioningTests`, `ParallelDeployTests` (which gives `PipelineRunner` a fake `deployer`, so deploys run without devices). `TemporaryDirectory` is the shared helper for throwaway directories.
+- Tests live in `Tests/OrchardTests/`, one file per area: `BuildPlatformTests`, `PipelineConfigTests`, `XcodeTests`, `GitTests`, `ShellTests`, `ContentViewLayoutTests`, `ActivityViewLayoutTests`, `DeployOutcomeTests`, `UpdaterTests`, `PipelineHistoryTests`, `DeviceDiscoveryTests`, `DeviceOnboardingTests`, `ProvisioningTests`, `SharingTests` (which starts a real `BuildServer` on a free localhost port and gives runners a temporary `sharedRoot`), `ParallelDeployTests` (which gives `PipelineRunner` a fake `deployer`, so deploys run without devices). `TemporaryDirectory` is the shared helper for throwaway directories.
 - `WindowHarness` hosts a SwiftUI view in a real `NSWindow`, so tests can drive and check the AppKit layout SwiftUI produces (split views, column widths) and render PNGs without Screen Recording permission. Its `OffscreenWindow` sits far off screen and behind everything, so test runs never cover the developer's windows. It still caps its size at the screen's, as AppKit does for on-screen windows (the layout tests pass on CI only with that cap); keep any new test windows off screen the same way (an `NSAlert` panel can't be moved off screen, so lay it out with `layout()` and render it without ordering it in). `makeTestStore()` gives an in-memory `AppStore` (no history on disk) without device discovery; never build one on `.standard` in tests. For automatic setup, pass fake `DeviceOnboarding.Commands` to `AppStore`, feed `onboard(_:)` the `PhysicalDevice`s of each poll and `await onboardingSettled()`; tests must never run the real `devicectl manage pair`.
-- `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list a `devices` state with a mixed device list, a `redeploy` state with a device that can be deployed again, an `onboarding` state with a device in each automatic-setup state, and the Settings window (`settings-off`, `settings-on`). The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
+- `ORCHARD_SCREENSHOTS=<dir> swift test --filter screenshots` renders the main window in light and dark mode for PR descriptions, including a `deploys` state with sample runs and expanded commit list a `devices` state with a mixed device list, a `redeploy` state with a device that can be deployed again, an `onboarding` state with a device in each automatic-setup state, the Settings window (`settings-off`, `settings-on`, `settings-builder`, `settings-client`), a `builder` pipeline, and a `client` pipeline with and without device support (`client`, `client-setup`). The Liquid Glass sidebar comes out blank in these renders (the window server draws it); say so in the PR.
 - They use `@testable import Orchard`, so test internal (not `private`) symbols. To test something that's `private`, test it through its public entry point, as `GitTests` does for `parseRefs`, or relax it to internal.
 - `GitTests` runs real `git` against temporary repos (a bare repo stands in as `origin`). Pass identity with `-c user.name=… -c user.email=…`, because CI has no global git config.
 - `ORCHARD_NETWORK_TESTS=1 swift test --filter Updater` downloads the latest real release and stages its app, to check the self-update download path end to end. CI doesn't run it.

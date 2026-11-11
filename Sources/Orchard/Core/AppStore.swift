@@ -25,6 +25,58 @@ final class AppStore {
             updateActivity()
         }
     }
+    // MARK: Builder and client
+
+    /// Builder: other Macs can download this Mac's builds. Off by default.
+    var sharesBuilds: Bool {
+        didSet {
+            guard sharesBuilds != oldValue else { return }
+            defaults?.set(sharesBuilds, forKey: sharesBuildsKey)
+            pipelines.forEach { $0.sharesBuilds = sharesBuilds }
+            updateServer()
+            updateActivity()
+        }
+    }
+    /// Why the builder isn't serving, e.g. its port is taken.
+    private(set) var sharingError: String?
+    /// What clients paste into their Settings: this Mac's address and the token.
+    var sharingLink: String {
+        BuilderLink.string(host: ProcessInfo.processInfo.hostName, port: BuilderLink.defaultPort, token: sharingToken)
+    }
+
+    enum BuilderStatus: Equatable {
+        case none
+        case invalidLink
+        case connecting
+        case connected(name: String, pipelines: Int)
+        case failed(String)
+    }
+    /// Client: the link of the builder to install builds from; empty for none.
+    var builderLink: String {
+        didSet {
+            guard builderLink != oldValue else { return }
+            defaults?.set(builderLink, forKey: builderLinkKey)
+            // Pipelines removed here come back when the link is entered again.
+            knownRemotePipelines = []
+            updateBuilder()
+        }
+    }
+    var builderStatus: BuilderStatus = .none
+    var builder: BuilderClient? { BuilderLink(builderLink).map(BuilderClient.init) }
+
+    enum DeviceSupportState: Equatable {
+        case installed
+        case missing
+        case installing
+        case failed(String)
+    }
+    /// Whether this Mac can talk to devices: it has Xcode, or the package a builder hands out.
+    var deviceSupport: DeviceSupportState = .installed
+    /// False on a Mac that only installs a builder's builds. Checked once, at launch.
+    let hasXcode: Bool
+    /// Whether the builder can hand out that package.
+    private(set) var builderHasDeviceSupport = false
+
     /// Devices automatic setup is working on, by identifier. Saved, so a device that restarts to
     /// turn on Developer Mode is still finished after Orchard relaunches.
     private(set) var onboarding: [String: OnboardingState] = [:]
@@ -33,6 +85,31 @@ final class AppStore {
     @ObservationIgnored private let defaultsKey = "pipelines"
     @ObservationIgnored private let automaticSetupKey = "setsUpDevicesAutomatically"
     @ObservationIgnored private let onboardingKey = "onboardingDevices"
+    @ObservationIgnored private let sharesBuildsKey = "sharesBuilds"
+    @ObservationIgnored private let sharingTokenKey = "sharingToken"
+    @ObservationIgnored private let builderLinkKey = "builderLink"
+    @ObservationIgnored private let knownRemoteKey = "knownBuilderPipelines"
+    @ObservationIgnored private var server: BuildServer?
+    @ObservationIgnored private var serverTask: Task<Void, Never>?
+    @ObservationIgnored private var builderTask: Task<Void, Never>?
+    @ObservationIgnored private lazy var sharingToken: String = {
+        if let token = defaults?.string(forKey: sharingTokenKey) { return token }
+        let token = BuilderLink.newToken()
+        defaults?.set(token, forKey: sharingTokenKey)
+        return token
+    }()
+    /// The builder's pipelines this Mac has added, so one the user deleted isn't added again.
+    @ObservationIgnored private var knownRemotePipelines: Set<String> {
+        get { Set(defaults?.stringArray(forKey: knownRemoteKey) ?? inMemoryKnownRemote) }
+        set {
+            inMemoryKnownRemote = Array(newValue)
+            defaults?.set(newValue.sorted(), forKey: knownRemoteKey)
+        }
+    }
+    @ObservationIgnored private var inMemoryKnownRemote: [String] = []
+
+    /// How often a client asks its builder which pipelines it shares.
+    static let builderPollInterval: Duration = .seconds(60)
     @ObservationIgnored private var activity: NSObjectProtocol?
     @ObservationIgnored private let discoversDevices: Bool
     @ObservationIgnored private let commands: DeviceOnboarding.Commands
@@ -59,6 +136,9 @@ final class AppStore {
         self.commands = commands
         self.deviceLog = deviceLog ?? (defaults == nil ? nil : .shared)
         setsUpDevicesAutomatically = defaults?.bool(forKey: automaticSetupKey) ?? false
+        sharesBuilds = defaults?.bool(forKey: sharesBuildsKey) ?? false
+        hasXcode = discoversDevices ? DeviceSupport.hasXcode : true
+        builderLink = defaults?.string(forKey: builderLinkKey) ?? ""
         if setsUpDevicesAutomatically {
             // The real state comes with the first poll.
             for id in defaults?.stringArray(forKey: onboardingKey) ?? [] { onboarding[id] = .unreachable }
@@ -67,8 +147,106 @@ final class AppStore {
             .flatMap { try? JSONDecoder().decode([PipelineConfig].self, from: $0) } ?? []
         pipelines = configs.map(makeRunner)
         updateActivity()
-        if discoversDevices { Task { await refreshDevices() } }
+        if discoversDevices {
+            if DeviceSupport.tool() == nil { deviceSupport = .missing }
+            Task { await refreshDevices() }
+            updateServer()
+            updateBuilder()
+        }
         updatePolling()
+    }
+
+    /// Starts or stops serving builds. Only the real store serves; tests use `BuildServer` directly.
+    private func updateServer() {
+        guard discoversDevices else { return }
+        serverTask?.cancel()
+        server?.stop()
+        server = nil
+        sharingError = nil
+        guard sharesBuilds else { return }
+        let service = BuildService(name: Host.current().localizedName ?? "Builder", token: sharingToken,
+                                   deviceSupport: DeviceSupport.package())
+        serverTask = Task { [weak self] in
+            do {
+                let server = try BuildServer(service: service, port: BuilderLink.defaultPort)
+                try await server.start()
+                guard let self, !Task.isCancelled, self.sharesBuilds else { return server.stop() }
+                self.server = server
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.sharingError = "Couldn't listen on port \(BuilderLink.defaultPort): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    /// Follows the builder's list of shared pipelines while there's a link.
+    private func updateBuilder() {
+        builderTask?.cancel()
+        builderTask = nil
+        let builder = builder
+        pipelines.forEach { $0.builder = builder }
+        guard let builder else {
+            builderStatus = builderLink.trimmingCharacters(in: .whitespaces).isEmpty ? .none : .invalidLink
+            return
+        }
+        builderStatus = .connecting
+        guard discoversDevices else { return }
+        builderTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let result: Result<BuildCatalog, Error>
+                do { result = .success(try await builder.catalog()) } catch { result = .failure(error) }
+                guard let self, !Task.isCancelled else { return }
+                self.sync(with: result)
+                try? await Task.sleep(for: Self.builderPollInterval)
+            }
+        }
+    }
+
+    /// Adds a pipeline for each one the builder shares that this Mac hasn't seen before. They
+    /// start disabled, with no devices: the user picks devices and enables them.
+    func sync(with result: Result<BuildCatalog, Error>) {
+        switch result {
+        case .failure(let error):
+            builderStatus = .failed(error.localizedDescription)
+        case .success(let catalog):
+            builderStatus = .connected(name: catalog.builder, pipelines: catalog.pipelines.count)
+            builderHasDeviceSupport = catalog.hasDeviceSupport
+            var known = knownRemotePipelines
+            for shared in catalog.pipelines where !known.contains(shared.id.uuidString) {
+                known.insert(shared.id.uuidString)
+                guard !pipelines.contains(where: { $0.config.remoteID == shared.id }) else { continue }
+                var config = PipelineConfig()
+                config.name = shared.name
+                config.remoteID = shared.id
+                pipelines.append(makeRunner(config))
+                save()
+            }
+            if known != knownRemotePipelines { knownRemotePipelines = known }
+        }
+    }
+
+    /// Downloads the builder's device support package and installs it, so this Mac can install
+    /// apps on devices without Xcode. Asks for an administrator password.
+    func installDeviceSupport() {
+        guard deviceSupport != .installing, let builder else { return }
+        deviceSupport = .installing
+        Task {
+            let package = FileManager.default.temporaryDirectory
+                .appendingPathComponent("orchard-device-support-\(UUID().uuidString).pkg")
+            defer { try? FileManager.default.removeItem(at: package) }
+            do {
+                try await builder.downloadDeviceSupport(to: package)
+                try await DeviceSupport.install(package)
+                deviceSupport = DeviceSupport.tool() == nil ? .failed("The package installed, but devicectl is still missing.") : .installed
+                log("Installed device support from the builder")
+                await refreshDevices()
+            } catch {
+                let reason = (error as? ShellError).map { $0.output.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    ?? error.localizedDescription
+                deviceSupport = .failed(reason)
+                log("Installing device support failed: \(reason)")
+            }
+        }
     }
 
     var anyEnabled: Bool { pipelines.contains { $0.config.isEnabled } }
@@ -236,6 +414,8 @@ final class AppStore {
         // Only the real store keeps history on disk; tests' in-memory stores leave no files behind.
         let runner = PipelineRunner(
             config: config, history: defaults == nil ? nil : PipelineHistory(pipeline: config.id))
+        runner.sharesBuilds = sharesBuilds
+        runner.builder = builder
         runner.onChange = { [weak self] in
             self?.save()
             self?.updateActivity()
@@ -251,7 +431,7 @@ final class AppStore {
     /// Keeps App Nap from throttling the poll timers while any pipeline is enabled or devices are
     /// set up automatically.
     private func updateActivity() {
-        let polls = anyEnabled || setsUpDevicesAutomatically
+        let polls = anyEnabled || setsUpDevicesAutomatically || sharesBuilds
         if polls, activity == nil {
             activity = ProcessInfo.processInfo.beginActivity(
                 options: [.userInitiatedAllowingIdleSystemSleep],

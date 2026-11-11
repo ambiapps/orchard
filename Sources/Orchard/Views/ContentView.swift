@@ -109,6 +109,7 @@ private struct PipelineRow: View {
 
     private var subtitle: String {
         if runner.status.isBusy || runner.config.isEnabled { return runner.status.label }
+        if runner.config.isRemote { return "From a builder" }
         return runner.config.branch ?? "Not configured"
     }
 }

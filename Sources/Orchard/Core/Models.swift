@@ -138,6 +138,15 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     /// configs decode.
     var deploysToNewDevices: Bool?
     var addsNewDevices: Bool { deploysToNewDevices ?? true }
+    /// A platform to build even when no chosen device needs it, so a builder can share builds
+    /// for devices that are only on its clients. Optional so older saved configs decode.
+    var alsoBuilds: BuildPlatform?
+    /// Set on a client: the builder's pipeline this one installs builds from, instead of
+    /// building a repository itself. Optional so older saved configs decode.
+    var remoteID: UUID?
+    /// The builder's builds (`SharedBuild.id`s) this client last tried to install, so a build
+    /// that failed isn't downloaded again on every poll.
+    var lastRemoteBuild: String?
 
     /// Last commit installed on every device (launching it may have failed, e.g. on a locked phone).
     var lastDeployedCommit: String?
@@ -147,11 +156,20 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
 
     var repoURL: URL? { repoPath.map { URL(fileURLWithPath: $0) } }
 
+    var isRemote: Bool { remoteID != nil }
+
+    /// The platforms a run builds: those of the chosen devices, and `alsoBuilds`.
+    var buildPlatforms: Set<BuildPlatform> {
+        Set(devices.map(\.platform)).union(alsoBuilds.map { [$0] } ?? [])
+    }
+
     var missingSetup: String? {
-        if repoPath == nil { return "Choose a repository" }
-        if branch == nil { return "Choose a branch" }
-        if scheme == nil { return "Choose a scheme" }
-        if devices.isEmpty { return "Choose at least one device" }
+        if !isRemote {
+            if repoPath == nil { return "Choose a repository" }
+            if branch == nil { return "Choose a branch" }
+            if scheme == nil { return "Choose a scheme" }
+        }
+        if buildPlatforms.isEmpty || (isRemote && devices.isEmpty) { return "Choose at least one device" }
         return nil
     }
 }
@@ -277,12 +295,14 @@ extension [LogLine] {
 /// How long each phase of a run took, for the log.
 struct RunTimings: Equatable, Sendable, Codable {
     var checkout: TimeInterval = 0
+    /// Fetching the build from a builder. Optional so older saved runs decode.
+    var download: TimeInterval?
     var build: TimeInterval = 0
     var deploy: TimeInterval = 0
 
     /// "checkout 3s", "build 4m 10s", … for the phases that ran.
     var phases: [String] {
-        [("checkout", checkout), ("build", build), ("deploy", deploy)]
+        [("checkout", checkout), ("download", download ?? 0), ("build", build), ("deploy", deploy)]
             .filter { $0.1 > 0 }
             .map { "\($0.0) \($0.1.formattedDuration)" }
     }
@@ -306,4 +326,9 @@ extension TimeInterval {
 
 extension String {
     var shortSHA: String { String(prefix(8)) }
+}
+
+extension Int64 {
+    /// "184 MB".
+    var formattedSize: String { ByteCountFormatter.string(fromByteCount: self, countStyle: .file) }
 }
