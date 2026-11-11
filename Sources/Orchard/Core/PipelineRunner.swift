@@ -12,7 +12,8 @@ final class PipelineRunner: Identifiable {
         case checking
         case preparing
         case building(BuildPlatform)
-        case deploying(String)
+        /// Names of the devices still being deployed to; they're deployed to at the same time.
+        case deploying([String])
 
         var isBusy: Bool {
             switch self {
@@ -28,7 +29,8 @@ final class PipelineRunner: Identifiable {
             case .checking: "Checking for changes…"
             case .preparing: "Checking out…"
             case .building(let platform): "Building for \(platform.displayName)…"
-            case .deploying(let device): "Deploying to \(device)…"
+            case .deploying(let devices):
+                devices.count == 1 ? "Deploying to \(devices[0])…" : "Deploying to \(devices.count) devices…"
             }
         }
     }
@@ -61,6 +63,10 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private let history: PipelineHistory?
     /// Devices that automatic setup just added and that still need their first deploy.
     @ObservationIgnored private var newDevices: [Device] = []
+    @ObservationIgnored private let deployer: DeployAction
+
+    /// Installs and launches an app on a device, logging the tools' output line by line.
+    typealias DeployAction = @Sendable (BuiltProduct, Device, @escaping @Sendable (String) -> Void) async throws -> Void
 
     nonisolated var id: UUID { _id }
     @ObservationIgnored private nonisolated let _id: UUID
@@ -68,8 +74,11 @@ final class PipelineRunner: Identifiable {
     static let maxLogLines = 2000
 
     /// `history` keeps deploys and the log across launches; without it they live only in memory.
-    init(config: PipelineConfig, history: PipelineHistory? = nil) {
+    /// Tests replace `deployer`, which otherwise needs real devices.
+    init(config: PipelineConfig, history: PipelineHistory? = nil,
+         deployer: @escaping DeployAction = { try await Deployer.deploy($0, to: $1, log: $2) }) {
         self._id = config.id
+        self.deployer = deployer
         self.config = config
         // Before `history` is set, so loading doesn't trigger a save (which would wipe a file
         // that failed to decode).
@@ -261,17 +270,13 @@ final class PipelineRunner: Identifiable {
                 append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
                 update { $0.products = ($0.products ?? [:]).merging([platform.rawValue: product]) { $1 } }
 
-                for device in devices {
-                    try Task.checkCancellation()
-                    let deployStart = Date()
-                    defer {
-                        timings.deploy += Date().timeIntervalSince(deployStart)
-                        update { $0.timings = timings }
-                    }
-                    try await deploy(product, to: device, log: raw) { outcome in
-                        update { $0.deviceOutcomes[device.id] = outcome }
-                    }
+                try Task.checkCancellation()
+                let deployStart = Date()
+                defer {
+                    timings.deploy += Date().timeIntervalSince(deployStart)
+                    update { $0.timings = timings }
                 }
+                try await deployAll(product, to: devices, run: record.id, log: raw)
             }
 
             let outcome = runs.first(where: { $0.id == record.id })?.finalOutcome(devices: config.devices)
@@ -340,9 +345,7 @@ final class PipelineRunner: Identifiable {
         if let logFile { raw = logger(file: logFile, condensed: false) } else { raw = { _ in } }
         append(.step, "Deploying \(run.commit.shortSHA) to \(device.name) again")
         do {
-            try await deploy(product, to: device, log: raw, announce: false) { outcome in
-                update { $0.deviceOutcomes[device.id] = outcome }
-            }
+            try await deployAll(product, to: [device], run: run.id, log: raw, announce: false)
         } catch {
             // Nothing changed on the device that matters; keep what the run recorded.
             update { $0.deviceOutcomes[device.id] = run.deviceOutcomes[device.id] }
@@ -361,16 +364,42 @@ final class PipelineRunner: Identifiable {
         }
     }
 
-    /// Installs and launches `product` on `device`, reporting its outcome as it goes.
+    /// Installs and launches `product` on all of `devices` at the same time, recording each
+    /// device's outcome on the run. Throws only `CancellationError`, which stops every deploy;
+    /// a failed deploy is an outcome and doesn't affect the other devices.
+    func deployAll(_ product: BuiltProduct, to devices: [Device], run: RunRecord.ID,
+                   log: @escaping @Sendable (String) -> Void, announce: Bool = true) async throws {
+        var remaining = devices.map(\.name)
+        status = .deploying(remaining)
+        try await withThrowingTaskGroup(of: String.self) { group in
+            for device in devices {
+                // Several devices write to the log at once, so say whose line each one is.
+                let deviceLog = devices.count > 1 ? Self.prefixing(log, with: device.name) : log
+                group.addTask {
+                    try await self.deploy(product, to: device, run: run, log: deviceLog, announce: announce)
+                    return device.name
+                }
+            }
+            for try await finished in group {
+                if let index = remaining.firstIndex(of: finished) { remaining.remove(at: index) }
+                if !remaining.isEmpty { status = .deploying(remaining) }
+            }
+        }
+    }
+
+    /// Installs and launches `product` on `device`, recording its outcome on the run as it goes.
     /// Throws only `CancellationError`; a failed deploy is an outcome.
-    private func deploy(_ product: BuiltProduct, to device: Device, log: @escaping @Sendable (String) -> Void,
-                        announce: Bool = true, outcome report: (DeployOutcome) -> Void) async throws {
-        status = .deploying(device.name)
+    private func deploy(_ product: BuiltProduct, to device: Device, run: RunRecord.ID,
+                        log: @escaping @Sendable (String) -> Void, announce: Bool) async throws {
+        func report(_ outcome: DeployOutcome) {
+            guard let index = runs.firstIndex(where: { $0.id == run }) else { return }
+            runs[index].deviceOutcomes[device.id] = outcome
+        }
         report(.running)
         if announce { append(.step, "Deploying to \(device.name)") }
         let start = Date()
         do {
-            try await Deployer.deploy(product, to: device, log: log)
+            try await deployer(product, device, log)
             report(.succeeded)
             append(.success, "Launched on \(device.name) in \(Date().timeIntervalSince(start).formattedDuration)")
         } catch is CancellationError {
@@ -384,6 +413,12 @@ final class PipelineRunner: Identifiable {
             report(.failed(message))
             append(.error, "\(device.name): \(message) (\(Date().timeIntervalSince(start).formattedDuration))")
         }
+    }
+
+    /// `log`, with each line marked as coming from the device called `name`.
+    nonisolated static func prefixing(_ log: @escaping @Sendable (String) -> Void,
+                                      with name: String) -> @Sendable (String) -> Void {
+        { line in log(line.allSatisfy(\.isWhitespace) ? line : "[\(name)] \(line)") }
     }
 
     /// Removes Orchard's checkout and build products for this pipeline.

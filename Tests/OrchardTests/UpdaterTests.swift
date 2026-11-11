@@ -46,6 +46,65 @@ struct UpdaterTests {
         #expect(Updater.isNewer(nextRelease, than: local))
     }
 
+    @Test func backgroundChecksInstallOnlyWhenOptedIn() {
+        func action(userInitiated: Bool = false, automatic: Bool, canInstall: Bool = true,
+                    skipped: String? = nil, failed: String? = nil) -> Updater.Action {
+            Updater.action(for: "v1.0.8(9)", userInitiated: userInitiated, automatic: automatic,
+                           canInstall: canInstall, skipped: skipped, failed: failed)
+        }
+        #expect(action(automatic: false) == .prompt)
+        #expect(action(automatic: true) == .install)
+        // A check from the menu always asks, even when opted in.
+        #expect(action(userInitiated: true, automatic: true) == .prompt)
+        #expect(action(userInitiated: true, automatic: true, skipped: "v1.0.8(9)") == .prompt)
+        // Can't replace the app (read-only folder, no DMG): fall back to the window.
+        #expect(action(automatic: true, canInstall: false) == .prompt)
+        // A skipped version stays skipped; skipping an older one doesn't count.
+        #expect(action(automatic: true, skipped: "v1.0.8(9)") == .none)
+        #expect(action(automatic: false, skipped: "v1.0.8(9)") == .none)
+        #expect(action(automatic: true, skipped: "v1.0.7(8)") == .install)
+        // An install that already failed isn't retried, or Orchard would relaunch in a loop.
+        #expect(action(automatic: true, failed: "v1.0.8(9)") == .none)
+        #expect(action(automatic: false, failed: "v1.0.8(9)") == .prompt)
+        #expect(action(automatic: true, failed: "v1.0.7(8)") == .install)
+    }
+
+    @Test func automaticInstallsAreOffUntilOptedInAndPersist() throws {
+        let defaults = try scratchDefaults()
+        let current = AppVersion(tag: "v1.0.7(8)")
+        #expect(!Updater(current: current, defaults: defaults).installsAutomatically)
+
+        Updater(current: current, defaults: defaults).setInstallsAutomatically(true)
+        let updater = Updater(current: current, defaults: defaults)
+        #expect(updater.installsAutomatically)
+
+        // `defaults write` on a running Orchard (over SSH) is picked up by the next check.
+        defaults.set(false, forKey: Updater.automaticKey)
+        updater.reloadSettings()
+        #expect(!updater.installsAutomatically)
+    }
+
+    @Test func aFailedSwapIsRememberedSoItIsNotInstalledAgain() throws {
+        let defaults = try scratchDefaults()
+        defaults.set("v1.0.8(9)", forKey: "pendingUpdateTag")
+        let stillOld = Updater(current: AppVersion(tag: "v1.0.7(8)"), defaults: defaults)
+        #expect(stillOld.takeFailedInstall() == AppVersion(tag: "v1.0.8(9)"))
+        #expect(defaults.string(forKey: "failedUpdateTag") == "v1.0.8(9)")
+        #expect(stillOld.takeFailedInstall() == nil)  // Reported once.
+
+        // The swap took: nothing to report or remember.
+        let other = try scratchDefaults()
+        other.set("v1.0.8(9)", forKey: "pendingUpdateTag")
+        #expect(Updater(current: AppVersion(tag: "v1.0.8(9)"), defaults: other).takeFailedInstall() == nil)
+        #expect(other.string(forKey: "failedUpdateTag") == nil)
+    }
+
+    @Test func automaticInstallsWaitForRunningPipelines() async {
+        var polls = 0
+        await Updater.waitUntilIdle({ polls += 1; return polls < 4 }, polling: .milliseconds(1))
+        #expect(polls == 4)
+    }
+
     @Test func alertButtonsReportWhichWasClicked() throws {
         var responses: [NSApplication.ModalResponse] = []
         for index in 0..<3 {
@@ -188,6 +247,8 @@ struct UpdaterTests {
         }
         """
 
+    private func scratchDefaults() throws -> UserDefaults { try #require(MemoryDefaults(suiteName: nil)) }
+
     private func makeApp(in dir: TemporaryDirectory, subfolder: String? = nil, name: String = "Orchard",
                          identifier: String = "se.ambi.Orchard", version: String, build: String) throws -> URL {
         var parent = dir.url
@@ -205,4 +266,16 @@ struct UpdaterTests {
         try plist.write(to: contents.appendingPathComponent("Info.plist"))
         return app
     }
+}
+
+/// Defaults kept in memory, so tests never write a preferences file or touch `.standard`.
+private final class MemoryDefaults: UserDefaults {
+    private var values: [String: Any] = [:]
+
+    override func object(forKey defaultName: String) -> Any? { values[defaultName] }
+    override func set(_ value: Any?, forKey defaultName: String) { values[defaultName] = value }
+    override func set(_ value: Bool, forKey defaultName: String) { values[defaultName] = value }
+    override func removeObject(forKey defaultName: String) { values[defaultName] = nil }
+    override func bool(forKey defaultName: String) -> Bool { values[defaultName] as? Bool ?? false }
+    override func string(forKey defaultName: String) -> String? { values[defaultName] as? String }
 }

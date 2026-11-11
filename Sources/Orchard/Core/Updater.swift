@@ -95,28 +95,55 @@ final class Updater {
         case installing
     }
 
+    /// What a check does about a newer release.
+    enum Action: Equatable {
+        case none
+        case prompt
+        case install
+    }
+
+    /// The defaults key behind `installsAutomatically`. A Mac nobody sits at can be opted in over
+    /// SSH: `defaults write se.ambi.Orchard automaticallyInstallUpdates -bool YES`.
+    nonisolated static let automaticKey = "automaticallyInstallUpdates"
+    /// How often to look for a release while updates install automatically.
+    nonisolated static let automaticCheckInterval: Duration = .seconds(60 * 60)
+
     nonisolated static let latestReleaseURL = URL(string: "https://api.github.com/repos/ambiapps/orchard/releases/latest")!
 
     private(set) var state: State = .idle
     /// The newer release found by the last check, if any.
     private(set) var available: Release?
+    /// Opt-in for Macs nobody sits at: install new releases without asking, once no pipeline is
+    /// building or deploying, and keep checking for them while running.
+    private(set) var installsAutomatically: Bool {
+        didSet { defaults?.set(installsAutomatically, forKey: Self.automaticKey) }
+    }
 
     @ObservationIgnored let current: AppVersion?
     @ObservationIgnored private let defaults: UserDefaults?
     @ObservationIgnored private let skippedKey = "skippedUpdateTag"
     /// The release an install was started for, so the next launch can tell whether it took.
     @ObservationIgnored private let pendingKey = "pendingUpdateTag"
+    /// The release whose swap didn't take, so it isn't installed (and relaunched for) in a loop.
+    @ObservationIgnored private let failedKey = "failedUpdateTag"
     @ObservationIgnored private var isPrompting = false
     @ObservationIgnored private var started = false
+    /// Set by "Install and Relaunch" while an automatic install waits for pipelines: don't wait.
+    @ObservationIgnored private var installNow = false
+    /// Releases a background check already showed the window for, so the hourly checks of
+    /// automatic installs that can't replace the app don't bring it back after "Later".
+    @ObservationIgnored private var promptedTags: Set<String> = []
     /// Whether a pipeline is building or deploying, so the alert can warn that updating stops it.
     @ObservationIgnored var isBusy: () -> Bool = { false }
 
     init(current: AppVersion? = .current(), defaults: UserDefaults? = .standard) {
         self.current = current
         self.defaults = defaults
+        installsAutomatically = defaults?.bool(forKey: Self.automaticKey) ?? false
     }
 
-    /// Checks once, shortly after launch; after that only "Check for Updates…" does. Does
+    /// Checks once, shortly after launch; after that only "Check for Updates…" does, unless
+    /// updates install automatically: then it checks every `automaticCheckInterval`. Does
     /// nothing when not running as a bundled .app, because there's no version to compare against.
     func start() {
         guard current != nil, !started else { return }
@@ -125,7 +152,25 @@ final class Updater {
         Task { [weak self] in
             try? await Task.sleep(for: .seconds(5))
             await self?.check(userInitiated: false)
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.automaticCheckInterval)
+                guard let self else { return }
+                reloadSettings()
+                if installsAutomatically { await check(userInitiated: false) }
+            }
         }
+    }
+
+    /// Turns automatic installs on or off. Turning them on checks right away.
+    func setInstallsAutomatically(_ on: Bool) {
+        installsAutomatically = on
+        if on, started { Task { await check(userInitiated: false) } }
+    }
+
+    /// Picks up a `defaults write` made while Orchard is running.
+    func reloadSettings() {
+        let stored = defaults?.bool(forKey: Self.automaticKey) ?? false
+        if stored != installsAutomatically { installsAutomatically = stored }
     }
 
     /// Looks for a newer release. Background checks only speak up about a version the user
@@ -151,10 +196,30 @@ final class Updater {
                 return
             }
             available = release
-            if userInitiated || defaults?.string(forKey: skippedKey) != release.tagName {
-                prompt(release)
+            let action = Self.action(
+                for: release.tagName, userInitiated: userInitiated, automatic: installsAutomatically,
+                canInstall: Self.installLocation() != nil && release.dmg != nil,
+                skipped: defaults?.string(forKey: skippedKey), failed: defaults?.string(forKey: failedKey))
+            switch action {
+            case .none: break
+            case .prompt:
+                if userInitiated || promptedTags.insert(release.tagName).inserted { prompt(release) }
+            case .install:
+                await install(release, unattended: true)
             }
         }
+    }
+
+    /// What to do about the newer release `tag`. A check from the menu always asks. A background
+    /// check stays quiet about a skipped version; with automatic installs on it installs
+    /// without asking, except a release whose install already failed once (`failed`): the launch
+    /// after that failure reported it, and trying again would quit and relaunch Orchard in a loop.
+    nonisolated static func action(for tag: String, userInitiated: Bool, automatic: Bool, canInstall: Bool,
+                                   skipped: String?, failed: String?) -> Action {
+        if userInitiated { return .prompt }
+        if tag == skipped { return .none }
+        guard automatic, canInstall else { return .prompt }
+        return tag == failed ? .none : .install
     }
 
     /// Whether `version` should be offered over `current`. Without a current version (`swift run`)
@@ -203,7 +268,9 @@ final class Updater {
             isPrompting = false
             switch choice {
             case .install:
-                if canInstall {
+                if state == .installing {
+                    installNow = true  // An automatic install is waiting for pipelines.
+                } else if canInstall {
                     Task { await self.install(release) }
                 } else {
                     NSWorkspace.shared.open(release.htmlURL)
@@ -219,11 +286,19 @@ final class Updater {
     /// If the last launch quit to install an update but this is still an older version, the
     /// swap script couldn't replace the app (for example, macOS blocked it). Say so once.
     private func reportFailedInstall() {
-        guard let tag = defaults?.string(forKey: pendingKey) else { return }
-        defaults?.removeObject(forKey: pendingKey)
-        guard let version = AppVersion(tag: tag), Self.isNewer(version, than: current) else { return }
+        guard let version = takeFailedInstall() else { return }
         showError("Couldn't install the update",
                   UpdateError("Orchard \(version) was downloaded, but the app at \(Bundle.main.bundlePath) couldn't be replaced. Download it from GitHub instead."))
+    }
+
+    /// The version the last launch quit to install, if this launch is still older than it.
+    /// Remembers its tag so automatic installs leave that release alone.
+    func takeFailedInstall() -> AppVersion? {
+        guard let tag = defaults?.string(forKey: pendingKey) else { return nil }
+        defaults?.removeObject(forKey: pendingKey)
+        guard let version = AppVersion(tag: tag), Self.isNewer(version, than: current) else { return nil }
+        defaults?.set(tag, forKey: failedKey)
+        return version
     }
 
     private func showUpToDate() {
@@ -252,17 +327,47 @@ final class Updater {
         return app
     }
 
-    private func install(_ release: Release) async {
+    /// `unattended` is an automatic install: it waits for running pipelines instead of stopping
+    /// them, and a failure is only logged, because nobody is there to dismiss an alert. The next
+    /// check tries again.
+    private func install(_ release: Release, unattended: Bool = false) async {
         guard state == .idle, let destination = Self.installLocation(), let dmg = release.dmg else { return }
         state = .installing
+        installNow = false
+        var work: URL?
         do {
             let staged = try await Self.download(dmg.browserDownloadURL, expecting: release.version)
+            work = staged.deletingLastPathComponent()
+            if unattended {
+                if isBusy() { NSLog("Orchard: %@ is ready; waiting for pipelines to finish", release.tagName) }
+                await Self.waitUntilIdle { [self] in !installNow && isBusy() }
+                reloadSettings()
+                // Turned off, or this version skipped, while waiting.
+                let wanted = installsAutomatically && defaults?.string(forKey: skippedKey) != release.tagName
+                guard installNow || wanted else {
+                    try? FileManager.default.removeItem(at: staged.deletingLastPathComponent())
+                    state = .idle
+                    return
+                }
+            }
             try Self.relaunch(replacing: destination, with: staged)
             defaults?.set(release.tagName, forKey: pendingKey)
             NSApp.terminate(nil)
         } catch {
+            if let work { try? FileManager.default.removeItem(at: work) }
             state = .idle
-            showError("Couldn't install the update", error)
+            if unattended {
+                NSLog("Orchard: couldn't install %@ automatically: %@", release.tagName, error.localizedDescription)
+            } else {
+                showError("Couldn't install the update", error)
+            }
+        }
+    }
+
+    /// Returns once `isBusy` says no pipeline is building or deploying.
+    static func waitUntilIdle(_ isBusy: () -> Bool, polling interval: Duration = .seconds(15)) async {
+        while isBusy() {
+            try? await Task.sleep(for: interval)
         }
     }
 

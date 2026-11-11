@@ -26,6 +26,7 @@ struct OrchardApp: App {
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") { Task { await updater.check(userInitiated: true) } }
                     .disabled(updater.state != .idle)
+                AutomaticUpdatesToggle(updater: updater)
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Pipeline") { store.addPipeline() }
@@ -85,11 +86,23 @@ private struct MenuBarContent: View {
             Button("Check for Updates…") { Task { await updater.check(userInitiated: true) } }
                 .disabled(updater.state != .idle)
         }
+        AutomaticUpdatesToggle(updater: updater)
         Button("Open Orchard…") {
             openWindow(id: "main")
             NSApp.activate()
         }
         Button("Quit Orchard") { NSApp.terminate(nil) }
             .keyboardShortcut("q")
+    }
+}
+
+/// The opt-in for Macs nobody sits at: install new releases without asking.
+struct AutomaticUpdatesToggle: View {
+    let updater: Updater
+
+    var body: some View {
+        Toggle("Install Updates Automatically", isOn: Binding(
+            get: { updater.installsAutomatically },
+            set: { updater.setInstallsAutomatically($0) }))
     }
 }

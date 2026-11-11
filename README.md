@@ -20,6 +20,14 @@ Every push to `main` builds a DMG (`./scripts/build-dmg.sh`) and publishes it as
 
 Orchard checks for a new release each time it starts. When one is out it shows a small **Update Available** window with a link to the release notes: **Install and Relaunch** downloads the DMG, replaces the app in place and reopens it; **Skip This Version** stops the reminders for that release. **Check for Updates…** is in the app menu and the menu bar menu. Self-updating needs write access to the folder Orchard lives in; otherwise the pop-up links to the download.
 
+On a Mac nobody sits at (a build machine you reach over SSH or screen sharing), turn on **Install Updates Automatically** in the app menu or the menu bar menu, or from a shell:
+
+```bash
+defaults write se.ambi.Orchard automaticallyInstallUpdates -bool YES
+```
+
+Orchard then checks for a release every hour and installs it without asking. It waits for running builds and deploys to finish first, and relaunches with the same pipelines enabled. It's off by default, and a `defaults write` on a running Orchard takes effect within the hour. A version you skipped stays skipped. A download that fails is tried again at the next check; a release that downloaded but couldn't replace the app isn't.
+
 ## Using it
 
 1. **+** to add a pipeline, then **Choose…** a local clone of the repo.
@@ -42,7 +50,7 @@ Orchard checks `devicectl list devices` every 10 seconds, pairs a device that sh
 
 - **Checkout:** a private detached `git worktree` per pipeline in `~/Library/Application Support/Orchard/Pipelines/<id>/` — your own checkout is never touched (other than `git fetch`).
 - **Build:** one `xcodebuild build` per platform (`generic/platform=iOS`, `platform=macOS`, …) with automatic signing (`-allowProvisioningUpdates`), so all iPhones and iPads share one build. Builds are incremental (each pipeline keeps its own DerivedData) and skip dSYMs (`DEBUG_INFORMATION_FORMAT=dwarf`), which deploys don't need. A build phase that requires a dSYM, such as a strict crash-reporter upload script, won't find one.
-- **Deploy:** `devicectl device install app` + `process launch --terminate-existing` for devices, `simctl install/launch` for simulators, quit + `open` for this Mac.
+- **Deploy:** `devicectl device install app` + `process launch --terminate-existing` for devices, `simctl install/launch` for simulators, quit + `open` for this Mac. Devices that share a build are deployed to at the same time.
 - A commit that fails isn't retried on every poll; push a new one or use **Build & Deploy Now**.
 - If the app installs but can't launch (for example, the phone is locked), the deploy shows a warning instead of failing and counts as deployed.
 - When a device fails or the app doesn't launch on it (disconnected, locked), click its name in the deploy to install and launch the same build on it again, without rebuilding. That works for the most recent build, until the next one starts.
