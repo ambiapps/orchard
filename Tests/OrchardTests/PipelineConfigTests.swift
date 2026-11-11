@@ -29,6 +29,15 @@ struct PipelineConfigTests {
         #expect(decoded == config)
     }
 
+    /// Configs saved before "Deploy to new devices" and device UDIDs existed must still load.
+    @Test func decodesConfigsSavedBeforeAutomaticSetup() throws {
+        let old = #"{"id":"8D4D0A0E-6B1E-4C3A-9B57-1A2B3C4D5E6F","name":"App","configuration":"Debug","pollInterval":60,"isEnabled":true,"devices":[{"id":"phone","name":"iPhone","model":"iPhone 17","kind":"physical","platform":"iOS","osVersion":"26.0"}]}"#
+        let config = try JSONDecoder().decode(PipelineConfig.self, from: Data(old.utf8))
+        #expect(config.devices.first?.udid == nil)
+        #expect(config.deploysToNewDevices == nil)
+        #expect(config.addsNewDevices)
+    }
+
     /// Devices saved before `udid` existed must still decode, or every pipeline is lost.
     @Test func decodesADeviceSavedWithoutUDID() throws {
         let json = #"""

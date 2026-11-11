@@ -36,6 +36,16 @@ Orchard then checks for a release every hour and installs it without asking. It 
 
 Orchard keeps running in the menu bar after the window closes.
 
+### Headless Macs: set up devices automatically
+
+For a Mac nobody sits at (say, a Mac Studio in the office), turn on **Settings → Set up connected devices automatically**. It's off by default. With it on, adding a phone takes no clicks on the Mac:
+
+1. Plug the device into the Mac with a cable, unlock it and tap **Trust**.
+2. If Developer Mode is off, the device asks to turn it on (or use Settings → Privacy & Security → Developer Mode) and restarts. Apple doesn't let a Mac do this.
+3. Unplug it. Orchard deploys to it over Wi-Fi from then on, as long as it's on the same network as the Mac.
+
+Orchard checks `devicectl list devices` every 10 seconds, pairs a device that shows up unpaired on a cable (`devicectl manage pair`, asked again until Trust is tapped), mounts the developer disk image (`devicectl device info ddiServices`; the first time needs internet access), and adds the device to every pipeline whose **Deploy to new devices** toggle is on (the default). Enabled pipelines then deploy their branch head to it right away, with the device as xcodebuild's destination so it's registered with your team. Pairing over the cable is all Wi-Fi needs: CoreDevice finds paired devices on the local network by itself. Each device's progress shows on its row in the device list and in `~/Library/Logs/Orchard/devices.log`; a step that fails is tried again on the next check. Devices you paired yourself are never touched, and the phone has to be on a network where Bonjour reaches the Mac (not a guest network that isolates clients).
+
 ## How it works
 
 - **Checkout:** a private detached `git worktree` per pipeline in `~/Library/Application Support/Orchard/Pipelines/<id>/` — your own checkout is never touched (other than `git fetch`).
@@ -49,4 +59,4 @@ Orchard keeps running in the menu bar after the window closes.
 
 ## Requirements
 
-macOS 15+, Xcode with a signed-in developer account for physical devices, and devices that are paired with Xcode and have Developer Mode on. Devices must be registered in your team (deploying once from Xcode does this).
+macOS 15+, Xcode with a signed-in developer account for physical devices, and devices that are paired with Xcode and have Developer Mode on. Devices must be registered in your team (deploying once from Xcode does this). With automatic setup on, Orchard pairs and registers devices itself.

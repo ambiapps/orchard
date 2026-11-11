@@ -61,6 +61,8 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var loopTask: Task<Void, Never>?
     @ObservationIgnored private var runTask: Task<Void, Never>?
     @ObservationIgnored private let history: PipelineHistory?
+    /// Devices that automatic setup just added and that still need their first deploy.
+    @ObservationIgnored private var newDevices: [Device] = []
     @ObservationIgnored private let deployer: DeployAction
 
     /// Installs and launches an app on a device, logging the tools' output line by line.
@@ -99,6 +101,7 @@ final class PipelineRunner: Identifiable {
             while !Task.isCancelled {
                 guard let self else { return }
                 await self.check(force: false)
+                await self.deployToNewDevices()
                 let interval = max(10, self.config.pollInterval)
                 self.nextCheck = Date().addingTimeInterval(interval)
                 try? await Task.sleep(for: .seconds(interval))
@@ -109,6 +112,7 @@ final class PipelineRunner: Identifiable {
     private func stop() {
         loopTask?.cancel()
         loopTask = nil
+        newDevices = []
         nextCheck = nil
         if !status.isBusy { status = .disabled }
         append(.info, "Disabled")
@@ -118,6 +122,26 @@ final class PipelineRunner: Identifiable {
     func buildNow() {
         guard runTask == nil else { return }
         Task { await check(force: true) }
+    }
+
+    /// Deploys the branch head to a device that automatic setup just added, without waiting for
+    /// the next commit. An enabled pipeline only; a disabled one deploys nothing by itself.
+    func deploy(toNew device: Device) {
+        guard config.isEnabled else { return }
+        newDevices.append(device)
+        Task { await deployToNewDevices() }
+    }
+
+    /// Waits while the pipeline is busy; the poll loop comes back to it. A device stays queued
+    /// until a run for it starts, so a check that fails (no network) is tried again.
+    private func deployToNewDevices() async {
+        while config.isEnabled, !status.isBusy, runTask == nil {
+            // The user may have unticked it since.
+            newDevices.removeAll { device in !config.devices.contains { $0.id == device.id } }
+            guard let device = newDevices.first else { return }
+            await check(force: true, newDevice: device)
+            if newDevices.first?.id == device.id { return }
+        }
     }
 
     func cancelRun() {
@@ -131,7 +155,7 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Polling
 
-    private func check(force: Bool) async {
+    private func check(force: Bool, newDevice: Device? = nil) async {
         guard runTask == nil else { return }
         if let missing = config.missingSetup {
             lastError = missing
@@ -147,14 +171,22 @@ final class PipelineRunner: Identifiable {
             remoteHead = head
             lastError = nil
             let isNew = head != config.lastDeployedCommit && head != config.lastAttemptedCommit
-            guard force || isNew else { return }
+            // Another check may have started a run while this one was asking for the head.
+            guard force || isNew, runTask == nil else { return }
             log = log.keepingRuns(config.keptRuns - 1)
             history?.replaceLog(with: log)
-            append(.step, force ? "Deploying \(branch) @ \(head.shortSHA) on request"
-                                : "New commit on \(branch): \(head.shortSHA)", startsRun: true)
+            var snapshot = config
+            if let newDevice {
+                newDevices.removeAll { $0.id == newDevice.id }
+                // The others already run this commit. A commit they don't have yet goes to everyone.
+                if head == config.lastDeployedCommit { snapshot.devices = [newDevice] }
+                append(.step, "Deploying \(branch) @ \(head.shortSHA) to new device \(newDevice.name)", startsRun: true)
+            } else {
+                append(.step, force ? "Deploying \(branch) @ \(head.shortSHA) on request"
+                                    : "New commit on \(branch): \(head.shortSHA)", startsRun: true)
+            }
 
-            let snapshot = config
-            let task = Task { await self.run(commit: head, config: snapshot) }
+            let task = Task { await self.run(commit: head, config: snapshot, newDevice: newDevice) }
             runTask = task
             await task.value
             runTask = nil
@@ -168,7 +200,8 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Build & deploy
 
-    private func run(commit: String, config: PipelineConfig) async {
+    /// `newDevice` is the destination of its platform's build, so xcodebuild registers it with the team.
+    private func run(commit: String, config: PipelineConfig, newDevice: Device? = nil) async {
         guard let repo = config.repoURL, let branch = config.branch, let scheme = config.scheme else { return }
         self.config.lastAttemptedCommit = commit
 
@@ -220,6 +253,7 @@ final class PipelineRunner: Identifiable {
                         let product = try await Xcode.build(
                             container: config.containerPath, scheme: scheme,
                             configuration: config.configuration, platform: platform,
+                            registering: newDevice?.platform == platform ? newDevice?.udid : nil,
                             in: dirs.checkout, derivedData: dirs.derivedData, log: build)
                         append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
                         return product
