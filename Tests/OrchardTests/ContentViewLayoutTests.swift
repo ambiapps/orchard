@@ -105,9 +105,15 @@ struct ContentViewLayoutTests {
                     _ = store.clientAccess.check(token: "g", name: "Grace's Mac mini", address: "192.168.1.24")
                     store.accessChanged(newRequest: nil)
                 } else {
-                    store.builderLink = "http://office-mac.local:8642"
-                    store.builderStatus = state == "client"
-                        ? .connected(name: "Office Mac", pipelines: 2) : .awaitingApproval(code: "042042")
+                    store.builderLinks = ["http://office-mac.local:8642", "http://studio.tailnet.ts.net:8642"]
+                    for (link, name) in zip(store.builders, ["Office Mac", "Studio"]) {
+                        if state == "client-pairing", name == "Studio" {
+                            store.sync(with: .failure(BuilderError.awaitingApproval), from: link)
+                        } else {
+                            store.sync(with: .success(BuildCatalog(builder: name, hasDeviceSupport: true, pipelines: [])),
+                                       from: link)
+                        }
+                    }
                 }
                 let settings = WindowHarness(SettingsView().environment(store), size: NSSize(width: 460, height: 200),
                                              appearance: appearance)
@@ -160,10 +166,16 @@ struct ContentViewLayoutTests {
         let installed = deviceSupport == .installed
         let store = AppStore(defaults: nil, discoversDevices: false,
                              devices: installed ? [this, DiscoveredDevice(device: iPhone, isConnected: true)] : [this])
-        store.builderLink = "http://office-mac.local:8642"
+        store.builderLinks = ["http://office-mac.local:8642", "http://studio.local:8642"]
+        let build = SharedBuild(platform: .iOS, commit: "5e1f0c2a9b7d4e6f8a1b3c5d7e9f0a2b4c6d8e0f",
+                                bundleIdentifier: "com.example.app", builtAt: Date().addingTimeInterval(-900))
         store.sync(with: .success(BuildCatalog(builder: "Office Mac", hasDeviceSupport: true, pipelines: [
+            SharedPipeline(id: UUID(), name: "Flightradar24", builds: [build]),
+            SharedPipeline(id: UUID(), name: "New Design", builds: []),
+        ])), from: store.builders[0])
+        store.sync(with: .success(BuildCatalog(builder: "Studio", hasDeviceSupport: false, pipelines: [
             SharedPipeline(id: UUID(), name: "Flightradar24", builds: []),
-        ])))
+        ])), from: store.builders[1])
         store.deviceSupport = deviceSupport
         let runner = store.pipelines[0]
         if installed {
@@ -174,6 +186,19 @@ struct ContentViewLayoutTests {
         defer { harness.close() }
         harness.window.title = runner.config.name
         try harness.snapshot(to: url)
+
+        // The sidebar's rows by themselves, because the sidebar comes out blank in a render.
+        guard installed else { return }
+        let rows = VStack(alignment: .leading, spacing: 6) {
+            ForEach(store.pipelines) { PipelineRow(runner: $0) }
+        }
+        .padding(12)
+        .frame(width: Layout.sidebarIdeal, alignment: .leading)
+        let sidebar = WindowHarness(rows, size: NSSize(width: Layout.sidebarIdeal, height: 150), appearance: appearance)
+        defer { sidebar.close() }
+        sidebar.window.title = "Pipelines"
+        try sidebar.snapshot(to: url.deletingLastPathComponent().appendingPathComponent(
+            url.lastPathComponent.replacingOccurrences(of: "client", with: "sidebar")))
     }
 
     /// A builder's pipeline, with the platform it also builds for its clients.

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// A build a builder shares with other Macs: one zipped .app per pipeline and platform.
 struct SharedBuild: Codable, Hashable, Sendable, Identifiable {
@@ -27,9 +28,9 @@ struct BuildCatalog: Codable, Sendable {
     var pipelines: [SharedPipeline]
 }
 
-/// The address a client enters: `http://host:port`. Links from Orchard 1.0.14 and earlier end in
+/// The address a client enters: `http://host:port`. Links from Orchard 1.0.15 and earlier end in
 /// `#token`; that part is ignored, because each client now gets its own token by being approved.
-struct BuilderLink: Equatable, Sendable {
+struct BuilderLink: Hashable, Sendable {
     static let defaultPort = 8642
 
     var baseURL: URL
@@ -66,6 +67,26 @@ enum SharedBuilds {
     private struct Entry: Codable {
         var pipeline: String
         var build: SharedBuild
+    }
+
+    /// A pipeline the builder has, whether or not it has built anything yet.
+    struct Listed: Codable, Equatable, Sendable {
+        var id: UUID
+        var name: String
+    }
+
+    private static func listURL(root: URL) -> URL {
+        root.appendingPathComponent("SharedPipelines.json")
+    }
+
+    /// Says which pipelines the builder has, so clients see them before their first build.
+    static func list(_ pipelines: [Listed], root: URL = Paths.pipelines) {
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(pipelines).write(to: listURL(root: root), options: .atomic)
+    }
+
+    static func listed(root: URL = Paths.pipelines) -> [Listed] {
+        (try? JSONDecoder().decode([Listed].self, from: Data(contentsOf: listURL(root: root)))) ?? []
     }
 
     static func directory(pipeline id: UUID, root: URL = Paths.pipelines) -> URL {
@@ -121,22 +142,29 @@ enum SharedBuilds {
 
     /// Stops sharing every pipeline's builds.
     static func removeAll(root: URL = Paths.pipelines) {
+        try? FileManager.default.removeItem(at: listURL(root: root))
         for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] {
             if let id = UUID(uuidString: name) { remove(pipeline: id, root: root) }
         }
     }
 
+    /// Every listed pipeline, with the builds it has (none before its first build), and any
+    /// other pipeline that has builds.
     static func catalog(root: URL = Paths.pipelines) -> [SharedPipeline] {
         let fm = FileManager.default
-        let ids = ((try? fm.contentsOfDirectory(atPath: root.path)) ?? []).compactMap(UUID.init(uuidString:))
+        let listed = listed(root: root)
+        let names = Dictionary(listed.map { ($0.id, $0.name) }) { first, _ in first }
+        var ids = listed.map(\.id)
+        for id in ((try? fm.contentsOfDirectory(atPath: root.path)) ?? []).compactMap(UUID.init(uuidString:))
+        where names[id] == nil { ids.append(id) }
         return ids.compactMap { id -> SharedPipeline? in
             let directory = directory(pipeline: id, root: root)
             let entries = ((try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
                 .filter { $0.pathExtension == "json" }
                 .compactMap { try? JSONDecoder().decode(Entry.self, from: Data(contentsOf: $0)) }
                 .sorted { $0.build.builtAt > $1.build.builtAt }
-            guard let newest = entries.first else { return nil }
-            return SharedPipeline(id: id, name: newest.pipeline, builds: entries.map(\.build))
+            guard let name = names[id] ?? entries.first?.pipeline else { return nil }
+            return SharedPipeline(id: id, name: name, builds: entries.map(\.build))
         }
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
@@ -175,8 +203,8 @@ enum BuilderError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .notConnected: "No builder link. Add one in Settings."
-        case .unauthorized: "The builder didn't accept this Mac. If it runs Orchard 1.0.14 or earlier, update it there."
+        case .notConnected: "This pipeline's builder isn't in Settings. Add its link there."
+        case .unauthorized: "The builder didn't accept this Mac. If it runs Orchard 1.0.15 or earlier, update it there."
         case .declined: "The builder declined this Mac."
         case .awaitingApproval: "Waiting for the builder to approve this Mac."
         case .notFound: "The builder no longer has that build."
@@ -211,18 +239,23 @@ struct BuilderClient: Equatable, Sendable {
         }
     }
 
-    /// Downloads `build`'s archive to `file`.
-    func download(_ build: SharedBuild, pipeline: UUID, to file: URL) async throws {
-        try await download("v1/builds/\(pipeline.uuidString)/\(build.id.uuidString).zip", to: file)
+    /// Downloads `build`'s archive to `file`. `progress` gets the fraction done, 0 to 1, each
+    /// time it grows by a percent; it may be called on any thread.
+    func download(_ build: SharedBuild, pipeline: UUID, to file: URL,
+                  progress: (@Sendable (Double) -> Void)? = nil) async throws {
+        try await download("v1/builds/\(pipeline.uuidString)/\(build.id.uuidString).zip", to: file, progress: progress)
     }
 
     func downloadDeviceSupport(to file: URL) async throws {
         try await download("v1/device-support.pkg", to: file)
     }
 
-    private func download(_ path: String, to file: URL) async throws {
+    private func download(_ path: String, to file: URL, progress: (@Sendable (Double) -> Void)? = nil) async throws {
         let request = request(path)
-        let (temporary, response) = try await Self.cancellable { try await URLSession.shared.download(for: request) }
+        let delegate = progress.map(DownloadProgress.init)
+        let (temporary, response) = try await Self.cancellable {
+            try await URLSession.shared.download(for: request, delegate: delegate)
+        }
         try check(response)
         try? FileManager.default.removeItem(at: file)
         try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -248,6 +281,39 @@ struct BuilderClient: Equatable, Sendable {
         case 403: throw BuilderError.awaitingApproval
         case 404: throw BuilderError.notFound
         case let code: throw BuilderError.status(code)
+        }
+    }
+}
+
+/// Reports a download's progress from the task's own `Progress`, a whole percent at a time.
+private final class DownloadProgress: NSObject, URLSessionTaskDelegate, Sendable {
+    private let report: @Sendable (Double) -> Void
+    private let state = OSAllocatedUnfairLock<(observation: NSKeyValueObservation?, percent: Int)>(
+        uncheckedState: (nil, 0))
+
+    init(report: @escaping @Sendable (Double) -> Void) {
+        self.report = report
+    }
+
+    func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+        let observation = task.progress.observe(\.fractionCompleted) { [report, state] progress, _ in
+            let fraction = progress.fractionCompleted
+            let percent = Int(fraction * 100)
+            let grew = state.withLockUnchecked { state -> Bool in
+                guard percent > state.percent else { return false }
+                state.percent = percent
+                return true
+            }
+            if grew { report(fraction) }
+        }
+        state.withLockUnchecked { $0.observation = observation }
+    }
+
+    /// The observation and this object hold on to each other until it's invalidated.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        state.withLockUnchecked {
+            $0.observation?.invalidate()
+            $0.observation = nil
         }
     }
 }

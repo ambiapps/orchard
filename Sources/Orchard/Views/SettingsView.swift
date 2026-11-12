@@ -66,37 +66,54 @@ struct SettingsView: View {
             }
 
             Section {
-                TextField("Builder link", text: $store.builderLink, prompt: Text("http://office-mac.local:8642"))
-                    .autocorrectionDisabled()
-                if case .awaitingApproval(let code) = store.builderStatus {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Label("Waiting for the builder to approve this Mac", systemImage: "hourglass")
-                            .font(.callout)
-                        Text(ClientIdentity.format(code))
-                            .font(.system(size: 28, weight: .semibold, design: .monospaced))
-                            .textSelection(.enabled)
-                        Text("Enter this code in Orchard's Settings on the builder.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                } else if let status = builderStatus {
+                ForEach(store.builderLinks.indices, id: \.self) { index in
+                    // A row can be asked for once more after it's removed.
+                    let link = store.builderLinks.indices.contains(index) ? store.builderLinks[index] : ""
                     HStack {
-                        Label(status.text, systemImage: status.symbol)
-                            .foregroundStyle(status.color)
-                            .font(.callout)
-                        if store.builderStatus == .declined {
-                            Spacer()
-                            Button("Ask Again") { store.requestApprovalAgain() }
+                        TextField("Builder link", text: Binding(
+                            get: { link },
+                            set: { if store.builderLinks.indices.contains(index) { store.builderLinks[index] = $0 } }),
+                                  prompt: Text("http://office-mac.local:8642"))
+                            .autocorrectionDisabled()
+                        if store.builderLinks.count > 1 || !link.isEmpty {
+                            Button("Remove Builder", systemImage: "minus.circle") { store.removeBuilderLink(at: index) }
+                                .buttonStyle(.borderless)
+                                .labelStyle(.iconOnly)
+                                .help("Remove this builder")
+                        }
+                    }
+                    if case .awaitingApproval(let code) = store.builderStatus(for: link) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("Waiting for the builder to approve this Mac", systemImage: "hourglass")
+                                .font(.callout)
+                            Text(ClientIdentity.format(code))
+                                .font(.system(size: 28, weight: .semibold, design: .monospaced))
+                                .textSelection(.enabled)
+                            Text("Enter this code in Orchard's Settings on the builder.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } else if let status = status(of: link) {
+                        HStack {
+                            Label(status.text, systemImage: status.symbol)
+                                .foregroundStyle(status.color)
+                                .font(.callout)
+                            if store.builderStatus(for: link) == .declined {
+                                Spacer()
+                                Button("Ask Again") { store.requestApprovalAgain() }
+                            }
                         }
                     }
                 }
+                Button("Add Builder") { store.builderLinks.append("") }
+                    .disabled(store.builderLinks.contains { $0.trimmingCharacters(in: .whitespaces).isEmpty })
             } header: {
                 Text("Client")
             } footer: {
                 footer("""
-                    Paste the link from a builder to install its builds on the devices connected to this Mac. \
-                    Someone at the builder approves this Mac with the code it shows. Then its pipelines show \
-                    up in the main window: choose your devices there and enable them.
+                    Paste the link from each builder to install its builds on the devices connected to this Mac. \
+                    Someone at the builder approves this Mac with the code it shows. Then the builder's \
+                    pipelines show up in the main window, named after it: choose your devices there and enable them.
                     """)
             }
         }
@@ -112,8 +129,8 @@ struct SettingsView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var builderStatus: (text: String, symbol: String, color: Color)? {
-        switch store.builderStatus {
+    private func status(of link: String) -> (text: String, symbol: String, color: Color)? {
+        switch store.builderStatus(for: link) {
         case .none: nil
         case .invalidLink: ("That isn't a builder link.", "exclamationmark.triangle", .orange)
         case .connecting: ("Connecting…", "ellipsis", .secondary)
