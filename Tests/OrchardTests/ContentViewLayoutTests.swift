@@ -99,11 +99,10 @@ struct ContentViewLayoutTests {
                 let store = makeTestStore()
                 if state == "builder" {
                     store.sharesBuilds = true
-                    _ = store.clientAccess.check(token: "a", name: "Ada's MacBook Air", code: "123456")
+                    _ = store.clientAccess.check(token: "a", name: "Ada's MacBook Air")
                     store.accessChanged(newRequest: nil)
-                    store.approve(store.pairingRequests[0], code: "123456")
-                    _ = store.clientAccess.check(token: "g", name: "Grace's Mac mini", code: "042042",
-                                                 address: "192.168.1.24")
+                    store.approve(store.pairingRequests[0], code: store.pairingRequests[0].code)
+                    _ = store.clientAccess.check(token: "g", name: "Grace's Mac mini", address: "192.168.1.24")
                     store.accessChanged(newRequest: nil)
                 } else {
                     store.builderLink = "http://office-mac.local:8642"

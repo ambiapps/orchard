@@ -33,6 +33,7 @@ struct HTTPResponse: Equatable, Sendable {
     }
     var status: Int
     var contentType = "text/plain; charset=utf-8"
+    var headers: [String: String] = [:]
     var body: Body
 
     static func text(_ status: Int, _ text: String) -> HTTPResponse {
@@ -65,9 +66,13 @@ struct BuildService: Sendable {
         let authorization = request.headers["authorization"] ?? ""
         let token = authorization.hasPrefix("Bearer ") ? String(authorization.dropFirst(7)) : nil
         switch access.check(token: token, name: request.headers[ClientHeader.name.lowercased()]?.removingPercentEncoding,
-                            code: request.headers[ClientHeader.code.lowercased()], address: request.remoteAddress) {
+                            address: request.remoteAddress) {
         case .allowed: break
         case .pending: return .text(403, "Waiting for approval")
+        case .declined:
+            var response = HTTPResponse.text(401, "Declined")
+            response.headers[ClientHeader.access] = "declined"
+            return response
         case .refused: return .text(401, "Unauthorized")
         }
         guard request.method == "GET" else { return .text(405, "Method not allowed") }
@@ -220,6 +225,7 @@ private final class Session: @unchecked Sendable {
         let head = "HTTP/1.1 \(response.status) \(response.reason)\r\n"
             + "Content-Type: \(response.contentType)\r\n"
             + "Content-Length: \(length)\r\n"
+            + response.headers.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)\r\n" }.joined()
             + "Connection: close\r\n\r\n"
         connection.send(content: Data(head.utf8) + content, completion: .contentProcessed { [self] error in
             error == nil ? sendFile() : close()

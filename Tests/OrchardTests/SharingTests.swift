@@ -52,67 +52,83 @@ struct SharingTests {
 
     // MARK: Approval
 
-    @Test func aNewClientWaitsForItsCode() {
+    @Test func aNewClientWaitsForItsCode() throws {
         let access = ClientAccess()
-        #expect(access.check(token: "t", name: "Ada's Mac", code: "123456", address: "10.0.0.2") == .pending)
-        #expect(access.check(token: "t", name: "Ada's Mac", code: "123456") == .pending)
-        let request = try! #require(access.pairingRequests.first)
+        let code = ClientAccess.code(forToken: "t")
+        #expect(access.check(token: "t", name: "Ada's Mac", address: "10.0.0.2") == .pending)
+        #expect(access.check(token: "t", name: "Ada's Mac") == .pending)
+        let request = try #require(access.pairingRequests.first)
         #expect(access.pairingRequests.count == 1)
         #expect(request.name == "Ada's Mac")
-        #expect(!access.approve(request.id, code: "654321"))
-        #expect(access.check(token: "t", name: "Ada's Mac", code: "123456") == .pending)
-        #expect(access.approve(request.id, code: "123 456"))
+        #expect(request.code == code)
+        #expect(ClientIdentity(token: "t", name: "Ada's Mac").code == code)
+        let wrong = code == "000000" ? "111111" : "000000"
+        #expect(!access.approve(request.id, code: wrong))
+        #expect(access.check(token: "t", name: "Ada's Mac") == .pending)
+        #expect(access.approve(request.id, code: ClientIdentity.format(code)))
         #expect(access.pairingRequests.isEmpty)
-        #expect(access.check(token: "t", name: nil, code: nil) == .allowed)
+        #expect(access.check(token: "t", name: nil) == .allowed)
         #expect(access.approvedClients.map(\.name) == ["Ada's Mac"])
         #expect(access.approvedClients.first?.tokenHash != "t")
-        #expect(access.check(token: "other", name: nil, code: nil) == .refused)
+        #expect(access.check(token: "other", name: nil) == .refused)
     }
 
-    @Test func aRequestNeedsANameAndASixDigitCode() {
+    @Test func aRequestNeedsATokenAndAName() {
         let access = ClientAccess()
-        #expect(access.check(token: nil, name: "Mac", code: "123456") == .refused)
-        #expect(access.check(token: "t", name: "Mac", code: nil) == .refused)
-        #expect(access.check(token: "t", name: "Mac", code: "12345") == .refused)
-        #expect(access.check(token: "t", name: "Mac", code: "12345x") == .refused)
-        #expect(access.check(token: "t", name: " ", code: "123456") == .refused)
+        #expect(access.check(token: nil, name: "Mac") == .refused)
+        #expect(access.check(token: "", name: "Mac") == .refused)
+        #expect(access.check(token: "t", name: " ") == .refused)
         #expect(access.pairingRequests.isEmpty)
     }
 
-    @Test func aDeclinedClientIsRefusedAndARemovedOneAsksAgain() throws {
+    @Test func aDeclinedClientStaysDeclinedAndARemovedOneAsksAgain() throws {
         let access = ClientAccess()
-        _ = access.check(token: "no", name: "Stranger", code: "111111")
+        _ = access.check(token: "no", name: "Stranger")
         access.decline(try #require(access.pairingRequests.first).id)
-        #expect(access.check(token: "no", name: "Stranger", code: "111111") == .refused)
+        #expect(access.check(token: "no", name: "Stranger") == .declined)
         #expect(access.pairingRequests.isEmpty)
+        // Saved declines survive a relaunch.
+        #expect(ClientAccess(declined: access.declinedTokens).check(token: "no", name: "Stranger") == .declined)
 
-        _ = access.check(token: "yes", name: "Ada's Mac", code: "222222")
-        #expect(access.approve(try #require(access.pairingRequests.first).id, code: "222222"))
+        _ = access.check(token: "yes", name: "Ada's Mac")
+        #expect(access.approve(try #require(access.pairingRequests.first).id, code: ClientAccess.code(forToken: "yes")))
         access.remove(try #require(access.approvedClients.first).id)
-        #expect(access.check(token: "yes", name: "Ada's Mac", code: "222222") == .pending)
+        #expect(access.check(token: "yes", name: "Ada's Mac") == .pending)
     }
 
     @Test func oldAndExcessRequestsAreDropped() {
         let access = ClientAccess()
         let start = Date()
-        _ = access.check(token: "gone", name: "Gone", code: "000000", now: start)
+        _ = access.check(token: "gone", name: "Gone", now: start)
         for index in 0..<ClientAccess.maxRequests {
-            _ = access.check(token: "t\(index)", name: "Mac \(index)", code: "123456",
+            _ = access.check(token: "t\(index)", name: "Mac \(index)", address: "10.0.0.\(index)",
                              now: start.addingTimeInterval(ClientAccess.requestLifetime + 1 + Double(index)))
         }
         #expect(!access.pairingRequests.contains { $0.name == "Gone" })
         #expect(access.pairingRequests.count == ClientAccess.maxRequests)
-        _ = access.check(token: "new", name: "New", code: "123456", now: start.addingTimeInterval(ClientAccess.requestLifetime + 20))
+        _ = access.check(token: "new", name: "New", now: start.addingTimeInterval(ClientAccess.requestLifetime + 20))
         #expect(access.pairingRequests.count == ClientAccess.maxRequests)
         #expect(access.pairingRequests.contains { $0.name == "New" })
         #expect(!access.pairingRequests.contains { $0.name == "Mac 0" })
+        access.prune(now: start.addingTimeInterval(1000))
+        #expect(access.pairingRequests.isEmpty)
     }
 
-    @Test func codesAreSixDigits() {
-        for _ in 0..<50 {
-            let identity = ClientIdentity.new(name: "Mac")
-            #expect(identity.code.count == 6 && identity.code.allSatisfy(\.isNumber))
+    /// A Mac sending request after request can't push other Macs' requests out.
+    @Test func oneAddressKeepsFewRequests() {
+        let access = ClientAccess()
+        _ = access.check(token: "real", name: "Ada's Mac", address: "10.0.0.2")
+        for index in 0..<50 {
+            _ = access.check(token: "spam\(index)", name: "Ada's Mac", address: "10.0.0.66")
         }
+        #expect(access.pairingRequests.filter { $0.address == "10.0.0.66" }.count == ClientAccess.maxRequestsPerAddress)
+        #expect(access.pairingRequests.contains { $0.address == "10.0.0.2" })
+    }
+
+    @Test func codesAreSixDigitsAndDifferByToken() {
+        let codes = (0..<50).map { _ in ClientIdentity.new(name: "Mac").code }
+        #expect(codes.allSatisfy { $0.count == 6 && $0.allSatisfy(\.isNumber) })
+        #expect(Set(codes).count > 40)
         #expect(ClientIdentity.format("012345") == "012 345")
     }
 
@@ -184,7 +200,7 @@ struct SharingTests {
             port: 0)
         let port = try await server.start()
         let link = try #require(BuilderLink("http://127.0.0.1:\(port)"))
-        return (server, BuilderClient(link: link, identity: ClientIdentity(token: token, code: "123456", name: "Client")))
+        return (server, BuilderClient(link: link, identity: ClientIdentity(token: token, name: "Client")))
     }
 
     @Test func clientDownloadsWhatTheBuilderBuilt() async throws {
@@ -214,13 +230,13 @@ struct SharingTests {
         let (server, unknown) = try await startServer(root: root.url, token: "new", access: access)
         defer { server.stop() }
         var client = unknown
-        client.identity = ClientIdentity(token: "new", code: "042042", name: "César's MacBook")
+        client.identity = ClientIdentity(token: "new", name: "César's MacBook")
         await #expect(throws: BuilderError.awaitingApproval) { try await client.catalog() }
         let request = try #require(access.pairingRequests.first)
         #expect(request.name == "César's MacBook")
-        #expect(request.code == "042042")
+        #expect(request.code == client.identity.code)
         #expect(request.address == "127.0.0.1")
-        #expect(access.approve(request.id, code: "042 042"))
+        #expect(access.approve(request.id, code: ClientIdentity.format(client.identity.code)))
         #expect(try await client.catalog().builder == "Office Mac")
     }
 
@@ -231,6 +247,16 @@ struct SharingTests {
         defer { server.stop() }
         await #expect(throws: BuilderError.awaitingApproval) { try await client.catalog() }
         access.decline(try #require(access.pairingRequests.first).id)
+        await #expect(throws: BuilderError.declined) { try await client.catalog() }
+    }
+
+    /// A builder on 1.0.14 or earlier answers 401 to every client; that isn't a decline.
+    @Test func aRefusalWithoutADeclineIsUnauthorized() async throws {
+        let root = try TemporaryDirectory()
+        let (server, unnamed) = try await startServer(root: root.url, token: "x", access: ClientAccess())
+        defer { server.stop() }
+        var client = unnamed
+        client.identity.name = ""
         await #expect(throws: BuilderError.unauthorized) { try await client.catalog() }
     }
 
@@ -388,13 +414,13 @@ struct SharingTests {
         store.sync(with: .failure(BuilderError.awaitingApproval))
         #expect(store.builderStatus == .awaitingApproval(code: identity.code))
 
-        // Editing the link to the same builder keeps the code; another builder gets a new one.
-        store.builderLink = "http://office-mac.local:8642"
+        // Correcting the host name keeps the token, and so the approval.
+        store.builderLink = "office-mac.tailnet.ts.net"
         #expect(store.builderIdentity == identity)
-        store.builderLink = "build-mac.local"
-        #expect(store.builderIdentity?.token != identity.token)
 
         store.sync(with: .failure(BuilderError.unauthorized))
+        #expect(store.builderStatus == .failed(BuilderError.unauthorized.errorDescription!))
+        store.sync(with: .failure(BuilderError.declined))
         #expect(store.builderStatus == .declined)
         let declined = try #require(store.builderIdentity)
         store.requestApprovalAgain()
@@ -405,12 +431,12 @@ struct SharingTests {
 
     @Test func theBuilderApprovesWithTheCode() throws {
         let store = makeTestStore(pipelines: 0)
-        #expect(store.clientAccess.check(token: "t", name: "Ada's Mac", code: "123456") == .pending)
+        #expect(store.clientAccess.check(token: "t", name: "Ada's Mac") == .pending)
         store.accessChanged(newRequest: nil)
         let request = try #require(store.pairingRequests.first)
-        #expect(!store.approve(request, code: "000000"))
+        #expect(!store.approve(request, code: request.code == "000000" ? "111111" : "000000"))
         #expect(store.approvedClients.isEmpty)
-        #expect(store.approve(request, code: "123456"))
+        #expect(store.approve(request, code: request.code))
         #expect(store.pairingRequests.isEmpty)
         #expect(store.approvedClients.map(\.name) == ["Ada's Mac"])
         store.removeClient(store.approvedClients[0])
@@ -423,12 +449,13 @@ struct SharingTests {
         let defaults = try #require(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
         let store = AppStore(defaults: defaults, discoversDevices: false)
-        _ = store.clientAccess.check(token: "t", name: "Ada's Mac", code: "123456")
+        _ = store.clientAccess.check(token: "t", name: "Ada's Mac")
         store.accessChanged(newRequest: nil)
-        #expect(store.approve(try #require(store.pairingRequests.first), code: "123456"))
+        let request = try #require(store.pairingRequests.first)
+        #expect(store.approve(request, code: request.code))
         let relaunched = AppStore(defaults: defaults, discoversDevices: false)
         #expect(relaunched.approvedClients.map(\.name) == ["Ada's Mac"])
-        #expect(relaunched.clientAccess.check(token: "t", name: nil, code: nil) == .allowed)
+        #expect(relaunched.clientAccess.check(token: "t", name: nil) == .allowed)
     }
 
     // MARK: Config

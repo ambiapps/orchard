@@ -120,7 +120,7 @@ struct SettingsView: View {
         case .connected(let name, let pipelines):
             ("Connected to \(name) · \(pipelines) pipeline\(pipelines == 1 ? "" : "s")", "checkmark.circle", .green)
         case .awaitingApproval: nil
-        case .declined: ("The builder declined this Mac, or removed it.", "xmark.circle", .orange)
+        case .declined: ("The builder declined this Mac.", "xmark.circle", .orange)
         case .failed(let reason): (reason, "exclamationmark.triangle", .orange)
         }
     }
@@ -152,8 +152,7 @@ private struct PairingRequestRow: View {
                 Spacer()
                 Button("Decline") { store.decline(request) }
                 Button("Approve", action: approve)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(code.filter(\.isNumber).count != 6)
+                    .disabled(code.filter { $0.isASCII && $0.isNumber }.count != 6)
             }
             if wrongCode {
                 Text("That isn't the code \(request.name) shows.")

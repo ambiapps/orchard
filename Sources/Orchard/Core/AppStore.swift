@@ -70,11 +70,9 @@ final class AppStore {
             let link = BuilderLink(builderLink)
             guard link != BuilderLink(oldValue) || link == nil else { return }
             // Pipelines removed here come back when the link is entered again.
-            if link?.baseURL != BuilderLink(oldValue)?.baseURL {
-                knownRemotePipelines = []
-                // Another builder approves this Mac on its own, with a new token and code.
-                builderIdentity = link == nil ? nil : .new(name: Self.computerName)
-            }
+            if link?.baseURL != BuilderLink(oldValue)?.baseURL { knownRemotePipelines = [] }
+            // One token for every builder, so correcting the host name keeps the approval.
+            if link != nil, builderIdentity == nil { builderIdentity = .new(name: Self.computerName) }
             updateBuilder()
         }
     }
@@ -83,7 +81,7 @@ final class AppStore {
         guard let link = BuilderLink(builderLink), let builderIdentity else { return nil }
         return BuilderClient(link: link, identity: builderIdentity)
     }
-    /// This Mac's token and code for the builder in `builderLink`.
+    /// This Mac's token (and so its code) for builders; made when a link is first entered.
     private(set) var builderIdentity: ClientIdentity? {
         didSet {
             guard builderIdentity != oldValue else { return }
@@ -114,6 +112,9 @@ final class AppStore {
     @ObservationIgnored private let onboardingKey = "onboardingDevices"
     @ObservationIgnored private let sharesBuildsKey = "sharesBuilds"
     @ObservationIgnored private let approvedClientsKey = "approvedClients"
+    @ObservationIgnored private let declinedClientsKey = "declinedClients"
+    @ObservationIgnored private var lastRequestNotification: Date?
+    @ObservationIgnored private var pruneTask: Task<Void, Never>?
     @ObservationIgnored private let builderIdentityKey = "builderIdentity"
     @ObservationIgnored private let builderLinkKey = "builderLink"
     @ObservationIgnored private let knownRemoteKey = "knownBuilderPipelines"
@@ -123,7 +124,8 @@ final class AppStore {
     /// Decides which clients the server lets in; lives as long as the store, across server restarts.
     @ObservationIgnored private(set) lazy var clientAccess: ClientAccess = ClientAccess(
         approved: defaults?.data(forKey: approvedClientsKey)
-            .flatMap { try? JSONDecoder().decode([ApprovedClient].self, from: $0) } ?? []
+            .flatMap { try? JSONDecoder().decode([ApprovedClient].self, from: $0) } ?? [],
+        declined: defaults?.stringArray(forKey: declinedClientsKey) ?? []
     ) { [weak self] request in
         Task { @MainActor in self?.accessChanged(newRequest: request) }
     }
@@ -200,7 +202,16 @@ final class AppStore {
         server?.stop()
         server = nil
         sharingError = nil
+        pruneTask?.cancel()
+        pruneTask = nil
         guard sharesBuilds else { return }
+        // Requests from Macs that stopped asking leave the list even when no other Mac asks.
+        pruneTask = Task { [clientAccess] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(30))
+                clientAccess.prune()
+            }
+        }
         let service = BuildService(name: Self.computerName, access: clientAccess,
                                    deviceSupport: DeviceSupport.package())
         serverTask = Task { [weak self] in
@@ -255,7 +266,7 @@ final class AppStore {
         switch result {
         case .failure(BuilderError.awaitingApproval):
             builderStatus = .awaitingApproval(code: builderIdentity?.code ?? "")
-        case .failure(BuilderError.unauthorized):
+        case .failure(BuilderError.declined):
             builderStatus = .declined
         case .failure(let error):
             builderStatus = .failed(error.localizedDescription)
@@ -312,7 +323,11 @@ final class AppStore {
             defaults?.set(try? JSONEncoder().encode(approved), forKey: approvedClientsKey)
         }
         pairingRequests = clientAccess.pairingRequests
-        if let newRequest, discoversDevices {
+        defaults?.set(clientAccess.declinedTokens, forKey: declinedClientsKey)
+        // At most one notification a minute, however many Macs ask.
+        if let newRequest, discoversDevices,
+           lastRequestNotification.map({ Date().timeIntervalSince($0) > 60 }) ?? true {
+            lastRequestNotification = Date()
             log("\(newRequest.name) asks to download builds")
             Notifier.post(title: "\(newRequest.name) wants this Mac's builds",
                           body: "To let it in, enter the code it shows in Orchard's Settings.")
