@@ -132,7 +132,8 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     /// How many builds the deploy list and log keep; nil means the default.
     /// Optional so older saved configs decode.
     var historyLimit: Int?
-    var keptRuns: Int { max(1, historyLimit ?? 20) }
+    var keptRuns: Int { max(1, historyLimit ?? Self.defaultHistoryLimit) }
+    static let defaultHistoryLimit = 5
     /// Whether devices that automatic setup brings in are added to this pipeline; nil means yes.
     /// Only used while "Set up connected devices automatically" is on. Optional so older saved
     /// configs decode.
@@ -144,6 +145,11 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     /// Set on a client: the builder's pipeline this one installs builds from, instead of
     /// building a repository itself. Optional so older saved configs decode.
     var remoteID: UUID?
+    /// Which builder `remoteID` is on: its link's address (`BuilderLink.baseURL`), since a client
+    /// can follow several. Nil for a pipeline saved when there could only be one.
+    var builderURL: String?
+    /// That builder's name as of the last answer from it, for the pipeline list.
+    var builderName: String?
     /// The builder's builds (`SharedBuild.id`s) this client last tried to install, so a build
     /// that failed isn't downloaded again on every poll.
     var lastRemoteBuild: String?
@@ -157,6 +163,10 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     var repoURL: URL? { repoPath.map { URL(fileURLWithPath: $0) } }
 
     var isRemote: Bool { remoteID != nil }
+    /// What to call the pipeline's builder: its name, or its host until it has answered.
+    var builderLabel: String? {
+        builderName ?? builderURL.flatMap { URL(string: $0)?.host() }
+    }
 
     /// The platforms a run builds: those of the chosen devices, and `alsoBuilds`.
     var buildPlatforms: Set<BuildPlatform> {

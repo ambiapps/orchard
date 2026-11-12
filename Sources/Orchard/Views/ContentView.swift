@@ -89,7 +89,7 @@ struct ContentView: View {
     }
 }
 
-private struct PipelineRow: View {
+struct PipelineRow: View {
     let runner: PipelineRunner
 
     var body: some View {
@@ -108,8 +108,13 @@ private struct PipelineRow: View {
     }
 
     private var subtitle: String {
+        if runner.config.isRemote {
+            // Which builder comes first: with several, that's what tells two pipelines apart.
+            let builder = runner.config.builderLabel ?? "No builder"
+            let shown = runner.status.isBusy || runner.config.isEnabled || runner.isWaitingForBuild
+            return shown ? "\(builder) · \(runner.statusLabel)" : builder
+        }
         if runner.status.isBusy || runner.config.isEnabled { return runner.status.label }
-        if runner.config.isRemote { return "From a builder" }
         return runner.config.branch ?? "Not configured"
     }
 }

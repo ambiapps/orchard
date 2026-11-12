@@ -135,7 +135,7 @@ struct HistoryLimitTests {
         let old = #"{"id":"8D4D0A0E-6B1E-4C3A-9B57-1A2B3C4D5E6F","name":"App","configuration":"Debug","devices":[],"pollInterval":60,"isEnabled":false}"#
         let config = try JSONDecoder().decode(PipelineConfig.self, from: Data(old.utf8))
         #expect(config.historyLimit == nil)
-        #expect(config.keptRuns == 20)
+        #expect(config.keptRuns == 5)
         var zero = config
         zero.historyLimit = 0
         #expect(zero.keptRuns == 1)

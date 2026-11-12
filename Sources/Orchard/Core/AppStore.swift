@@ -35,6 +35,8 @@ final class AppStore {
             pipelines.forEach { $0.sharesBuilds = sharesBuilds }
             // Clients must not keep getting builds this Mac no longer means to share.
             if !sharesBuilds, discoversDevices { SharedBuilds.removeAll() }
+            listedPipelines = nil
+            listSharedPipelines()
             updateServer()
             updateActivity()
         }
@@ -53,21 +55,45 @@ final class AppStore {
         case connected(name: String, pipelines: Int)
         case failed(String)
     }
-    /// Client: the link of the builder to install builds from; empty for none.
-    var builderLink: String {
+    /// Client: the links of the builders to install builds from, one per row in Settings. A
+    /// blank row is an empty string; there's always at least one row.
+    var builderLinks: [String] {
         didSet {
-            guard builderLink != oldValue else { return }
-            defaults?.set(builderLink, forKey: builderLinkKey)
-            // Nothing changes while the link is edited without becoming another builder's.
-            let link = BuilderLink(builderLink)
-            guard link != BuilderLink(oldValue) || link == nil else { return }
-            // Pipelines removed here come back when the link is entered again.
-            if link?.baseURL != BuilderLink(oldValue)?.baseURL { knownRemotePipelines = [] }
-            updateBuilder()
+            guard builderLinks != oldValue else { return }
+            defaults?.set(builderLinks.filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty },
+                          forKey: builderLinksKey)
+            updateBuilders()
         }
     }
-    var builderStatus: BuilderStatus = .none
-    var builder: BuilderClient? { BuilderLink(builderLink).map(BuilderClient.init) }
+    /// What each builder last answered, by its link's address.
+    private(set) var builderStatuses: [URL: BuilderStatus] = [:]
+    /// The builders that can hand out the device support package.
+    private(set) var deviceSupportBuilders: Set<URL> = []
+
+    /// The usable links, each builder once.
+    var builders: [BuilderLink] {
+        var seen = Set<URL>()
+        return builderLinks.compactMap(BuilderLink.init).filter { seen.insert($0.baseURL).inserted }
+    }
+
+    /// The state of one row in Settings.
+    func builderStatus(for link: String) -> BuilderStatus {
+        if link.trimmingCharacters(in: .whitespaces).isEmpty { return .none }
+        guard let link = BuilderLink(link) else { return .invalidLink }
+        return builderStatuses[link.baseURL] ?? .connecting
+    }
+
+    /// Removes a row. The builder's pipelines stay until the user deletes them, and those of
+    /// its pipelines that were deleted earlier come back if its link is added again.
+    func removeBuilderLink(at index: Int) {
+        guard builderLinks.indices.contains(index) else { return }
+        var links = builderLinks
+        let removed = links.remove(at: index)
+        if let address = BuilderLink(removed)?.baseURL, !links.compactMap(BuilderLink.init).contains(where: { $0.baseURL == address }) {
+            knownRemotePipelines.subtract(catalogPipelines[address] ?? [])
+        }
+        builderLinks = links.isEmpty ? [""] : links
+    }
 
     enum DeviceSupportState: Equatable {
         case installed
@@ -79,8 +105,8 @@ final class AppStore {
     var deviceSupport: DeviceSupportState = .installed
     /// False on a Mac that only installs a builder's builds. Checked once, at launch.
     let hasXcode: Bool
-    /// Whether the builder can hand out that package.
-    private(set) var builderHasDeviceSupport = false
+    /// Whether a builder can hand out that package.
+    var builderHasDeviceSupport: Bool { !deviceSupportBuilders.isEmpty }
 
     /// Devices automatic setup is working on, by identifier. Saved, so a device that restarts to
     /// turn on Developer Mode is still finished after Orchard relaunches.
@@ -92,11 +118,19 @@ final class AppStore {
     @ObservationIgnored private let onboardingKey = "onboardingDevices"
     @ObservationIgnored private let sharesBuildsKey = "sharesBuilds"
     @ObservationIgnored private let sharingTokenKey = "sharingToken"
+    /// The one link of versions before there could be several; read once, never written.
     @ObservationIgnored private let builderLinkKey = "builderLink"
+    @ObservationIgnored private let builderLinksKey = "builderLinks"
     @ObservationIgnored private let knownRemoteKey = "knownBuilderPipelines"
     @ObservationIgnored private var server: BuildServer?
     @ObservationIgnored private var serverTask: Task<Void, Never>?
-    @ObservationIgnored private var builderTask: Task<Void, Never>?
+    @ObservationIgnored private var builderTasks: [BuilderLink: Task<Void, Never>] = [:]
+    /// The links being followed, to tell a new one from one that's still there.
+    @ObservationIgnored private var followed: [BuilderLink] = []
+    /// The pipelines each builder last listed, so removing a builder forgets only its own.
+    @ObservationIgnored private var catalogPipelines: [URL: Set<String>] = [:]
+    /// What `SharedPipelines.json` was last written with.
+    @ObservationIgnored private var listedPipelines: [SharedBuilds.Listed]?
     @ObservationIgnored private lazy var sharingToken: String = {
         if let token = defaults?.string(forKey: sharingTokenKey) { return token }
         let token = BuilderLink.newToken()
@@ -113,7 +147,7 @@ final class AppStore {
     }
     @ObservationIgnored private var inMemoryKnownRemote: [String] = []
 
-    /// How often a client asks its builder which pipelines it shares.
+    /// How often a client asks each builder which pipelines it shares.
     static let builderPollInterval: Duration = .seconds(60)
     @ObservationIgnored private var activity: NSObjectProtocol?
     @ObservationIgnored private let discoversDevices: Bool
@@ -143,7 +177,9 @@ final class AppStore {
         setsUpDevicesAutomatically = defaults?.bool(forKey: automaticSetupKey) ?? false
         sharesBuilds = defaults?.bool(forKey: sharesBuildsKey) ?? false
         hasXcode = discoversDevices ? DeviceSupport.hasXcode : true
-        builderLink = defaults?.string(forKey: builderLinkKey) ?? ""
+        let links = defaults?.stringArray(forKey: builderLinksKey)
+            ?? [defaults?.string(forKey: builderLinkKey) ?? ""].filter { !$0.isEmpty }
+        builderLinks = links.isEmpty ? [""] : links
         if setsUpDevicesAutomatically {
             // The real state comes with the first poll.
             for id in defaults?.stringArray(forKey: onboardingKey) ?? [] { onboarding[id] = .unreachable }
@@ -151,13 +187,20 @@ final class AppStore {
         let configs = defaults?.data(forKey: defaultsKey)
             .flatMap { try? JSONDecoder().decode([PipelineConfig].self, from: $0) } ?? []
         pipelines = configs.map(makeRunner)
+        // Saved when there could only be one builder: that's the one they're on.
+        if builders.count == 1 {
+            for runner in pipelines where runner.config.isRemote && runner.config.builderURL == nil {
+                runner.config.builderURL = builders[0].baseURL.absoluteString
+            }
+        }
         updateActivity()
         if discoversDevices {
             if DeviceSupport.tool() == nil { deviceSupport = .missing }
             Task { await refreshDevices() }
             updateServer()
-            updateBuilder()
         }
+        listSharedPipelines()
+        updateBuilders()
         updatePolling()
     }
 
@@ -192,56 +235,120 @@ final class AppStore {
         }
     }
 
-    /// Follows the builder's list of shared pipelines while there's a link.
-    private func updateBuilder() {
-        builderTask?.cancel()
-        builderTask = nil
-        let builder = builder
-        pipelines.forEach { $0.builder = builder }
-        guard let builder else {
-            builderStatus = builderLink.trimmingCharacters(in: .whitespaces).isEmpty ? .none : .invalidLink
-            return
+    /// Tells clients which pipelines this builder has, so they show up there before their
+    /// first build. Only pipelines that are set up, so a client doesn't get one that's still
+    /// being created; pipelines this Mac itself gets from a builder aren't passed on.
+    private func listSharedPipelines() {
+        guard discoversDevices, sharesBuilds else { return }
+        let list = pipelines.filter { !$0.config.isRemote && $0.config.missingSetup == nil }
+            .map { SharedBuilds.Listed(id: $0.id, name: $0.config.name) }
+        guard list != listedPipelines else { return }
+        listedPipelines = list
+        SharedBuilds.list(list)
+    }
+
+    /// Follows each builder's list of pipelines while its link is there.
+    private func updateBuilders() {
+        let links = builders
+        for (link, task) in builderTasks where !links.contains(link) {
+            task.cancel()
+            builderTasks[link] = nil
         }
-        builderStatus = .connecting
-        guard discoversDevices else { return }
-        builderTask = Task { [weak self] in
-            while !Task.isCancelled {
-                let result: Result<BuildCatalog, Error>
-                do { result = .success(try await builder.catalog()) } catch { result = .failure(error) }
-                guard let self, !Task.isCancelled else { return }
-                self.sync(with: result)
-                try? await Task.sleep(for: Self.builderPollInterval)
+        let addresses = Set(links.map(\.baseURL))
+        builderStatuses = builderStatuses.filter { addresses.contains($0.key) }
+        deviceSupportBuilders.formIntersection(addresses)
+        catalogPipelines = catalogPipelines.filter { addresses.contains($0.key) }
+        // A new link, or a new token for the same address, hasn't been answered yet.
+        for link in links where !followed.contains(link) { builderStatuses[link.baseURL] = .connecting }
+        followed = links
+        for link in links where builderTasks[link] == nil {
+            guard discoversDevices else { continue }
+            builderTasks[link] = Task { [weak self] in
+                let builder = BuilderClient(link: link)
+                while !Task.isCancelled {
+                    let result: Result<BuildCatalog, Error>
+                    do { result = .success(try await builder.catalog()) } catch { result = .failure(error) }
+                    guard let self, !Task.isCancelled else { return }
+                    self.sync(with: result, from: link)
+                    try? await Task.sleep(for: Self.builderPollInterval)
+                }
             }
+        }
+        assignBuilders()
+    }
+
+    /// The builder a remote pipeline gets its builds from.
+    private func builder(for config: PipelineConfig) -> BuilderClient? {
+        guard config.isRemote else { return nil }
+        let links = builders
+        if let address = config.builderURL {
+            return links.first { $0.baseURL.absoluteString == address }.map(BuilderClient.init)
+        }
+        // Saved when there could only be one builder; `sync` records which it is.
+        return links.count == 1 ? BuilderClient(link: links[0]) : nil
+    }
+
+    private func assignBuilders() {
+        for runner in pipelines {
+            runner.builder = builder(for: runner.config)
+            // Without a builder there's nothing to wait for.
+            if runner.builder == nil, runner.remote != nil { runner.remote = nil }
         }
     }
 
-    /// Adds a pipeline for each one the builder shares that this Mac hasn't seen before. They
-    /// start disabled, with no devices: the user picks devices and enables them.
-    func sync(with result: Result<BuildCatalog, Error>) {
+    /// Takes a builder's answer: adds a pipeline for each of its pipelines this Mac hasn't seen
+    /// before, and tells the ones it has what the builder has built. New ones start disabled,
+    /// with no devices: the user picks devices and enables them.
+    func sync(with result: Result<BuildCatalog, Error>, from link: BuilderLink) {
+        guard builders.contains(link) else { return }
         switch result {
         case .failure(let error):
-            builderStatus = .failed(error.localizedDescription)
+            builderStatuses[link.baseURL] = .failed(error.localizedDescription)
+            // What it had is no longer known, so its pipelines don't claim to wait for a build.
+            for runner in pipelines where runner.config.builderURL == link.baseURL.absoluteString {
+                runner.remote = nil
+            }
         case .success(let catalog):
-            builderStatus = .connected(name: catalog.builder, pipelines: catalog.pipelines.count)
-            builderHasDeviceSupport = catalog.hasDeviceSupport
+            let address = link.baseURL.absoluteString
+            let addresses = Set(builders.map(\.baseURL.absoluteString))
+            builderStatuses[link.baseURL] = .connected(name: catalog.builder, pipelines: catalog.pipelines.count)
+            if catalog.hasDeviceSupport {
+                deviceSupportBuilders.insert(link.baseURL)
+            } else {
+                deviceSupportBuilders.remove(link.baseURL)
+            }
+            catalogPipelines[link.baseURL] = Set(catalog.pipelines.map(\.id.uuidString))
             var known = knownRemotePipelines
-            for shared in catalog.pipelines where !known.contains(shared.id.uuidString) {
+            for shared in catalog.pipelines {
+                if let runner = pipelines.first(where: { $0.config.remoteID == shared.id }) {
+                    // A pipeline whose builder's link is gone (its address changed, or it was
+                    // saved before links were recorded) belongs to the builder that has it.
+                    if !addresses.contains(runner.config.builderURL ?? "") { runner.config.builderURL = address }
+                } else if !known.contains(shared.id.uuidString) {
+                    var config = PipelineConfig()
+                    config.name = shared.name
+                    config.remoteID = shared.id
+                    config.builderURL = address
+                    pipelines.append(makeRunner(config))
+                    save()
+                }
                 known.insert(shared.id.uuidString)
-                guard !pipelines.contains(where: { $0.config.remoteID == shared.id }) else { continue }
-                var config = PipelineConfig()
-                config.name = shared.name
-                config.remoteID = shared.id
-                pipelines.append(makeRunner(config))
-                save()
             }
             if known != knownRemotePipelines { knownRemotePipelines = known }
+            for runner in pipelines where runner.config.builderURL == address {
+                if runner.config.builderName != catalog.builder { runner.config.builderName = catalog.builder }
+                runner.remote = catalog.pipelines.first { $0.id == runner.config.remoteID }
+            }
+            assignBuilders()
         }
     }
 
     /// Downloads the builder's device support package and installs it, so this Mac can install
     /// apps on devices without Xcode. Asks for an administrator password.
     func installDeviceSupport() {
-        guard deviceSupport != .installing, let builder else { return }
+        guard deviceSupport != .installing,
+              let link = builders.first(where: { deviceSupportBuilders.contains($0.baseURL) }) else { return }
+        let builder = BuilderClient(link: link)
         deviceSupport = .installing
         Task {
             let package = FileManager.default.temporaryDirectory
@@ -428,7 +535,7 @@ final class AppStore {
         let runner = PipelineRunner(
             config: config, history: defaults == nil ? nil : PipelineHistory(pipeline: config.id))
         runner.sharesBuilds = sharesBuilds
-        runner.builder = builder
+        runner.builder = builder(for: config)
         runner.onChange = { [weak self] in
             self?.save()
             self?.updateActivity()
@@ -439,6 +546,7 @@ final class AppStore {
     private func save() {
         let data = try? JSONEncoder().encode(pipelines.map(\.config))
         defaults?.set(data, forKey: defaultsKey)
+        listSharedPipelines()
     }
 
     /// Keeps App Nap from throttling the poll timers while any pipeline is enabled or devices are

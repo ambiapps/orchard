@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import Orchard
 
@@ -83,6 +84,23 @@ struct SharingTests {
         #expect(SharedBuilds.catalog(root: root.url) == [SharedPipeline(id: pipeline.id, name: "App", builds: [second])])
     }
 
+    /// Clients see a builder's pipelines before their first build.
+    @Test func pipelinesAreListedBeforeTheyHaveABuild() async throws {
+        let root = try TemporaryDirectory()
+        let built = PipelineConfig(name: "Built")
+        let waiting = PipelineConfig(name: "Waiting")
+        let build = try await SharedBuilds.publish(try makeApp(in: root), platform: .iOS, commit: commit,
+                                                   subject: nil, pipeline: built, root: root.url)
+        SharedBuilds.list([.init(id: waiting.id, name: "Waiting"), .init(id: built.id, name: "Renamed")],
+                          root: root.url)
+        #expect(SharedBuilds.catalog(root: root.url) == [
+            SharedPipeline(id: built.id, name: "Renamed", builds: [build]),
+            SharedPipeline(id: waiting.id, name: "Waiting", builds: []),
+        ])
+        SharedBuilds.removeAll(root: root.url)
+        #expect(SharedBuilds.catalog(root: root.url).isEmpty)
+    }
+
     @Test func buildsOfPlatformsNoLongerBuiltAreRemoved() async throws {
         let root = try TemporaryDirectory()
         let pipeline = PipelineConfig(name: "App")
@@ -125,7 +143,13 @@ struct SharingTests {
 
         let downloads = try TemporaryDirectory()
         let zip = downloads.url.appendingPathComponent("iOS.zip")
-        try await client.download(build, pipeline: pipeline.id, to: zip)
+        let progress = OSAllocatedUnfairLock(initialState: [Double]())
+        try await client.download(build, pipeline: pipeline.id, to: zip) { fraction in
+            progress.withLock { $0.append(fraction) }
+        }
+        let reported = progress.withLock { $0 }
+        #expect(reported.last == 1)
+        #expect(reported == reported.sorted())
         let product = try await SharedBuilds.unpack(zip, into: downloads.url.appendingPathComponent("iOS"))
         #expect(product.bundleIdentifier == "com.example.app")
         #expect(try String(contentsOf: product.appURL.appendingPathComponent("binary"), encoding: .utf8) == "contents")
@@ -224,24 +248,56 @@ struct SharingTests {
         #expect(runner.runs.isEmpty)
     }
 
-    @Test func remotePipelineSaysWhenTheBuilderHasNoBuild() async throws {
+    @Test func remotePipelineWaitsForTheBuildersFirstBuild() async throws {
         let builderRoot = try TemporaryDirectory()
         let shared = PipelineConfig(name: "App")
-        try await SharedBuilds.publish(try makeApp(in: builderRoot), platform: .iOS, commit: commit, subject: nil,
-                                       pipeline: shared, root: builderRoot.url)
+        SharedBuilds.list([.init(id: shared.id, name: "App")], root: builderRoot.url)
         let (server, client) = try await startServer(root: builderRoot.url)
         defer { server.stop() }
+        let installed = Installed()
+        let clientRoot = try TemporaryDirectory()
         let runner = PipelineRunner(config: PipelineConfig(devices: [.thisMac], remoteID: shared.id),
-                                    deployer: { _, _, _ in })
+                                    sharedRoot: clientRoot.url,
+                                    deployer: { product, _, _ in await installed.add(product) })
         await runner.check(force: false)
         #expect(runner.lastError == BuilderError.notConnected.errorDescription)
+        #expect(!runner.isWaitingForBuild)
+
+        // The builder has the pipeline, but no build: that's waiting, not an error.
         runner.builder = client
         await runner.check(force: false)
-        #expect(runner.lastError == BuilderError.noBuild.errorDescription)
         await runner.check(force: false)
-        // The same answer on every poll is logged once.
-        #expect(runner.log.filter { $0.text.contains(BuilderError.noBuild.errorDescription!) }.count == 1)
+        #expect(runner.lastError == nil)
+        #expect(runner.isWaitingForBuild)
+        #expect(runner.statusLabel == "No build yet")
+        #expect(runner.log.filter { $0.text == "Waiting for Office Mac to build this pipeline" }.count == 1)
         #expect(runner.runs.isEmpty)
+
+        // A build for a platform none of the devices has is still waiting.
+        let product = try makeApp(in: builderRoot)
+        try await SharedBuilds.publish(product, platform: .iOS, commit: commit, subject: nil,
+                                       pipeline: shared, root: builderRoot.url)
+        await runner.check(force: false)
+        #expect(runner.isWaitingForBuild)
+
+        try await SharedBuilds.publish(product, platform: .macOS, commit: commit, subject: nil,
+                                       pipeline: shared, root: builderRoot.url)
+        await runner.check(force: false)
+        #expect(!runner.isWaitingForBuild)
+        #expect(await installed.products.count == 1)
+        #expect(runner.statusLabel == "Disabled")
+    }
+
+    @Test func aPipelineTheBuilderDroppedIsAnError() async throws {
+        let builderRoot = try TemporaryDirectory()
+        let (server, client) = try await startServer(root: builderRoot.url)
+        defer { server.stop() }
+        let runner = PipelineRunner(config: PipelineConfig(devices: [.thisMac], remoteID: UUID()),
+                                    deployer: { _, _, _ in })
+        runner.builder = client
+        await runner.check(force: false)
+        #expect(runner.lastError == BuilderError.notShared.errorDescription)
+        #expect(!runner.isWaitingForBuild)
     }
 
     private actor Installed {
@@ -253,35 +309,131 @@ struct SharingTests {
 
     // MARK: Store
 
+    private let office = BuilderLink("office-mac.local/#token")!
+    private let studio = BuilderLink("studio.local/#other")!
+
     @Test func builderPipelinesAreAddedOnce() throws {
         let store = makeTestStore(pipelines: 0)
-        store.builderLink = "office-mac.local/#token"
+        #expect(store.builderLinks == [""])
+        store.builderLinks = ["office-mac.local/#token"]
+        #expect(store.builderStatus(for: store.builderLinks[0]) == .connecting)
         let shared = SharedPipeline(id: UUID(), name: "Flightradar24", builds: [])
         let catalog = BuildCatalog(builder: "Office Mac", hasDeviceSupport: true, pipelines: [shared])
-        store.sync(with: .success(catalog))
-        store.sync(with: .success(catalog))
+        store.sync(with: .success(catalog), from: office)
+        store.sync(with: .success(catalog), from: office)
         #expect(store.pipelines.map(\.config.name) == ["Flightradar24"])
-        #expect(store.pipelines[0].config.remoteID == shared.id)
-        #expect(store.pipelines[0].config.isEnabled == false)
-        #expect(store.pipelines[0].builder == store.builder)
-        #expect(store.builderStatus == .connected(name: "Office Mac", pipelines: 1))
+        let runner = store.pipelines[0]
+        #expect(runner.config.remoteID == shared.id)
+        #expect(runner.config.isEnabled == false)
+        #expect(runner.config.builderLabel == "Office Mac")
+        #expect(runner.builder == BuilderClient(link: office))
+        #expect(runner.isWaitingForBuild)
+        #expect(store.builderStatus(for: store.builderLinks[0]) == .connected(name: "Office Mac", pipelines: 1))
+        #expect(store.builderHasDeviceSupport)
 
-        // One the user deleted stays deleted, until the link is entered again.
-        store.remove(store.pipelines[0])
-        store.sync(with: .success(catalog))
+        // One the user deleted stays deleted, until its builder is removed and added again.
+        store.remove(runner)
+        store.sync(with: .success(catalog), from: office)
         #expect(store.pipelines.isEmpty)
-        store.builderLink = ""
-        #expect(store.builderStatus == .none)
-        store.builderLink = "office-mac.local/#token"
-        store.sync(with: .success(catalog))
+        store.removeBuilderLink(at: 0)
+        #expect(store.builderLinks == [""])
+        #expect(store.builderStatus(for: "") == .none)
+        #expect(!store.builderHasDeviceSupport)
+        store.builderLinks = ["office-mac.local/#token"]
+        store.sync(with: .success(catalog), from: office)
         #expect(store.pipelines.count == 1)
+    }
+
+    @Test func eachBuilderHasItsOwnPipelines() throws {
+        let store = makeTestStore(pipelines: 0)
+        store.builderLinks = ["office-mac.local/#token", "studio.local/#other"]
+        let app = SharedPipeline(id: UUID(), name: "App", builds: [])
+        let build = SharedBuild(platform: .iOS, commit: commit, bundleIdentifier: "com.example.app")
+        let other = SharedPipeline(id: UUID(), name: "App", builds: [build])
+        store.sync(with: .success(BuildCatalog(builder: "Office Mac", hasDeviceSupport: false, pipelines: [app])),
+                   from: office)
+        store.sync(with: .success(BuildCatalog(builder: "Studio", hasDeviceSupport: true, pipelines: [other])),
+                   from: studio)
+        #expect(store.pipelines.map(\.config.builderLabel) == ["Office Mac", "Studio"])
+        #expect(store.pipelines.map(\.builder) == [BuilderClient(link: office), BuilderClient(link: studio)])
+        #expect(store.pipelines.map(\.isWaitingForBuild) == [true, false])
+        #expect(store.pipelines[1].remoteBuilds == [build])
+        #expect(store.builderStatus(for: "studio.local/#other") == .connected(name: "Studio", pipelines: 1))
+
+        // One builder failing says nothing about the other.
+        store.sync(with: .failure(BuilderError.unauthorized), from: office)
+        #expect(store.builderStatus(for: "office-mac.local/#token") == .failed(BuilderError.unauthorized.errorDescription!))
+        #expect(store.builderStatus(for: "studio.local/#other") == .connected(name: "Studio", pipelines: 1))
+
+        // A failed builder's pipelines don't claim to be waiting for a build.
+        #expect(store.pipelines.map(\.isWaitingForBuild) == [false, false])
+
+        // Removing a builder keeps its pipelines, which then have nowhere to get builds from,
+        // and doesn't bring back a pipeline of the other builder that was deleted here.
+        store.remove(store.pipelines[1])
+        store.removeBuilderLink(at: 0)
+        store.sync(with: .success(BuildCatalog(builder: "Studio", hasDeviceSupport: true, pipelines: [other])),
+                   from: studio)
+        #expect(store.pipelines.count == 1)
+        store.sync(with: .success(BuildCatalog(builder: "Studio", hasDeviceSupport: true,
+                                               pipelines: [other, SharedPipeline(id: UUID(), name: "New", builds: [])])),
+                   from: studio)
+        #expect(store.pipelines.count == 2)
+        #expect(store.pipelines[0].builder == nil)
+        #expect(store.pipelines[1].builder == BuilderClient(link: studio))
+        // An answer that was on its way from the removed builder is ignored.
+        store.sync(with: .success(BuildCatalog(builder: "Office Mac", hasDeviceSupport: false, pipelines: [])),
+                   from: office)
+        #expect(store.builderStatus(for: "office-mac.local/#token") == .connecting)
+    }
+
+    /// A pipeline follows its builder to a new address (say, its Tailscale name), and one saved
+    /// before 1.0.15 finds out which builder it's on.
+    @Test func aPipelineFollowsItsBuilderToANewAddress() throws {
+        let store = makeTestStore(pipelines: 0)
+        store.builderLinks = ["office-mac.local/#token"]
+        let shared = SharedPipeline(id: UUID(), name: "App", builds: [])
+        let catalog = BuildCatalog(builder: "Office Mac", hasDeviceSupport: false, pipelines: [shared])
+        store.sync(with: .success(catalog), from: office)
+        let runner = store.pipelines[0]
+
+        runner.config.builderURL = nil
+        store.builderLinks = ["office-mac.local/#token"]
+        store.sync(with: .success(catalog), from: office)
+        #expect(runner.config.builderURL == office.baseURL.absoluteString)
+
+        let moved = try #require(BuilderLink("100.64.0.7/#token"))
+        store.builderLinks = ["100.64.0.7/#token"]
+        #expect(runner.builder == nil)
+        store.sync(with: .success(catalog), from: moved)
+        #expect(store.pipelines.count == 1)
+        #expect(runner.builder == BuilderClient(link: moved))
+    }
+
+    @Test func theLinkOfEarlierVersionsIsKept() throws {
+        let name = "OrchardTests-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: name))
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set("office-mac.local/#token", forKey: "builderLink")
+        let store = AppStore(defaults: defaults, discoversDevices: false)
+        #expect(store.builderLinks == ["office-mac.local/#token"])
+        #expect(store.builders == [office])
+        store.builderLinks.append("")
+        store.builderLinks[1] = "studio.local/#other"
+        #expect(defaults.stringArray(forKey: "builderLinks") == ["office-mac.local/#token", "studio.local/#other"])
     }
 
     @Test func aBadLinkIsReported() {
         let store = makeTestStore(pipelines: 0)
-        store.builderLink = "office-mac.local"
-        #expect(store.builderStatus == .invalidLink)
-        #expect(store.builder == nil)
+        store.builderLinks = ["office-mac.local"]
+        #expect(store.builderStatus(for: "office-mac.local") == .invalidLink)
+        #expect(store.builders.isEmpty)
+
+        // A corrected token starts over, instead of showing the old token's answer.
+        store.builderLinks = ["office-mac.local/#wrong"]
+        store.sync(with: .failure(BuilderError.unauthorized), from: BuilderLink("office-mac.local/#wrong")!)
+        store.builderLinks = ["office-mac.local/#token"]
+        #expect(store.builderStatus(for: "office-mac.local/#token") == .connecting)
     }
 
     // MARK: Config
