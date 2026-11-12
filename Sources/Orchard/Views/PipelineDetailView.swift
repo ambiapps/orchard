@@ -341,8 +341,11 @@ private struct DevicesSection: View {
         Binding {
             isSelected(device)
         } set: { isOn in
-            runner.config.devices.removeAll { $0.id == device.id }
-            if isOn { runner.config.devices.append(device) }
+            // Enabled devices sort first, so toggling moves the row; animate the move.
+            withAnimation {
+                runner.config.devices.removeAll { $0.id == device.id }
+                if isOn { runner.config.devices.append(device) }
+            }
         }
     }
 }
