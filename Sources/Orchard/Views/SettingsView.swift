@@ -55,20 +55,22 @@ struct SettingsView: View {
 
             Section {
                 ForEach(store.builderLinks.indices, id: \.self) { index in
+                    // A row can be asked for once more after it's removed.
+                    let link = store.builderLinks.indices.contains(index) ? store.builderLinks[index] : ""
                     HStack {
                         TextField("Builder link", text: Binding(
-                            get: { store.builderLinks.indices.contains(index) ? store.builderLinks[index] : "" },
+                            get: { link },
                             set: { if store.builderLinks.indices.contains(index) { store.builderLinks[index] = $0 } }),
                                   prompt: Text("http://office-mac.local:8642/#…"))
                             .autocorrectionDisabled()
-                        if store.builderLinks.count > 1 || !store.builderLinks[index].isEmpty {
+                        if store.builderLinks.count > 1 || !link.isEmpty {
                             Button("Remove Builder", systemImage: "minus.circle") { store.removeBuilderLink(at: index) }
                                 .buttonStyle(.borderless)
                                 .labelStyle(.iconOnly)
                                 .help("Remove this builder")
                         }
                     }
-                    if let status = status(of: store.builderLinks[index]) {
+                    if let status = status(of: link) {
                         Label(status.text, systemImage: status.symbol)
                             .foregroundStyle(status.color)
                             .font(.callout)

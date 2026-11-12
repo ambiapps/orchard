@@ -365,8 +365,19 @@ struct SharingTests {
         #expect(store.builderStatus(for: "office-mac.local/#token") == .failed(BuilderError.unauthorized.errorDescription!))
         #expect(store.builderStatus(for: "studio.local/#other") == .connected(name: "Studio", pipelines: 1))
 
-        // Removing a builder keeps its pipelines, which then have nowhere to get builds from.
+        // A failed builder's pipelines don't claim to be waiting for a build.
+        #expect(store.pipelines.map(\.isWaitingForBuild) == [false, false])
+
+        // Removing a builder keeps its pipelines, which then have nowhere to get builds from,
+        // and doesn't bring back a pipeline of the other builder that was deleted here.
+        store.remove(store.pipelines[1])
         store.removeBuilderLink(at: 0)
+        store.sync(with: .success(BuildCatalog(builder: "Studio", hasDeviceSupport: true, pipelines: [other])),
+                   from: studio)
+        #expect(store.pipelines.count == 1)
+        store.sync(with: .success(BuildCatalog(builder: "Studio", hasDeviceSupport: true,
+                                               pipelines: [other, SharedPipeline(id: UUID(), name: "New", builds: [])])),
+                   from: studio)
         #expect(store.pipelines.count == 2)
         #expect(store.pipelines[0].builder == nil)
         #expect(store.pipelines[1].builder == BuilderClient(link: studio))
@@ -417,6 +428,12 @@ struct SharingTests {
         store.builderLinks = ["office-mac.local"]
         #expect(store.builderStatus(for: "office-mac.local") == .invalidLink)
         #expect(store.builders.isEmpty)
+
+        // A corrected token starts over, instead of showing the old token's answer.
+        store.builderLinks = ["office-mac.local/#wrong"]
+        store.sync(with: .failure(BuilderError.unauthorized), from: BuilderLink("office-mac.local/#wrong")!)
+        store.builderLinks = ["office-mac.local/#token"]
+        #expect(store.builderStatus(for: "office-mac.local/#token") == .connecting)
     }
 
     // MARK: Config

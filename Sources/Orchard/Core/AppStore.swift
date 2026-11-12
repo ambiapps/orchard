@@ -83,13 +83,15 @@ final class AppStore {
         return builderStatuses[link.baseURL] ?? .connecting
     }
 
-    /// Removes a row. The builder's pipelines stay until the user deletes them, and pipelines
-    /// deleted earlier come back if a link is added again.
+    /// Removes a row. The builder's pipelines stay until the user deletes them, and those of
+    /// its pipelines that were deleted earlier come back if its link is added again.
     func removeBuilderLink(at index: Int) {
         guard builderLinks.indices.contains(index) else { return }
         var links = builderLinks
-        links.remove(at: index)
-        knownRemotePipelines = []
+        let removed = links.remove(at: index)
+        if let address = BuilderLink(removed)?.baseURL, !links.compactMap(BuilderLink.init).contains(where: { $0.baseURL == address }) {
+            knownRemotePipelines.subtract(catalogPipelines[address] ?? [])
+        }
         builderLinks = links.isEmpty ? [""] : links
     }
 
@@ -123,6 +125,10 @@ final class AppStore {
     @ObservationIgnored private var server: BuildServer?
     @ObservationIgnored private var serverTask: Task<Void, Never>?
     @ObservationIgnored private var builderTasks: [BuilderLink: Task<Void, Never>] = [:]
+    /// The links being followed, to tell a new one from one that's still there.
+    @ObservationIgnored private var followed: [BuilderLink] = []
+    /// The pipelines each builder last listed, so removing a builder forgets only its own.
+    @ObservationIgnored private var catalogPipelines: [URL: Set<String>] = [:]
     /// What `SharedPipelines.json` was last written with.
     @ObservationIgnored private var listedPipelines: [SharedBuilds.Listed]?
     @ObservationIgnored private lazy var sharingToken: String = {
@@ -181,6 +187,12 @@ final class AppStore {
         let configs = defaults?.data(forKey: defaultsKey)
             .flatMap { try? JSONDecoder().decode([PipelineConfig].self, from: $0) } ?? []
         pipelines = configs.map(makeRunner)
+        // Saved when there could only be one builder: that's the one they're on.
+        if builders.count == 1 {
+            for runner in pipelines where runner.config.isRemote && runner.config.builderURL == nil {
+                runner.config.builderURL = builders[0].baseURL.absoluteString
+            }
+        }
         updateActivity()
         if discoversDevices {
             if DeviceSupport.tool() == nil { deviceSupport = .missing }
@@ -224,10 +236,12 @@ final class AppStore {
     }
 
     /// Tells clients which pipelines this builder has, so they show up there before their
-    /// first build. Pipelines this Mac itself gets from a builder aren't passed on.
+    /// first build. Only pipelines that are set up, so a client doesn't get one that's still
+    /// being created; pipelines this Mac itself gets from a builder aren't passed on.
     private func listSharedPipelines() {
         guard discoversDevices, sharesBuilds else { return }
-        let list = pipelines.filter { !$0.config.isRemote }.map { SharedBuilds.Listed(id: $0.id, name: $0.config.name) }
+        let list = pipelines.filter { !$0.config.isRemote && $0.config.missingSetup == nil }
+            .map { SharedBuilds.Listed(id: $0.id, name: $0.config.name) }
         guard list != listedPipelines else { return }
         listedPipelines = list
         SharedBuilds.list(list)
@@ -243,8 +257,11 @@ final class AppStore {
         let addresses = Set(links.map(\.baseURL))
         builderStatuses = builderStatuses.filter { addresses.contains($0.key) }
         deviceSupportBuilders.formIntersection(addresses)
+        catalogPipelines = catalogPipelines.filter { addresses.contains($0.key) }
+        // A new link, or a new token for the same address, hasn't been answered yet.
+        for link in links where !followed.contains(link) { builderStatuses[link.baseURL] = .connecting }
+        followed = links
         for link in links where builderTasks[link] == nil {
-            if builderStatuses[link.baseURL] == nil { builderStatuses[link.baseURL] = .connecting }
             guard discoversDevices else { continue }
             builderTasks[link] = Task { [weak self] in
                 let builder = BuilderClient(link: link)
@@ -272,7 +289,11 @@ final class AppStore {
     }
 
     private func assignBuilders() {
-        for runner in pipelines { runner.builder = builder(for: runner.config) }
+        for runner in pipelines {
+            runner.builder = builder(for: runner.config)
+            // Without a builder there's nothing to wait for.
+            if runner.builder == nil, runner.remote != nil { runner.remote = nil }
+        }
     }
 
     /// Takes a builder's answer: adds a pipeline for each of its pipelines this Mac hasn't seen
@@ -283,6 +304,10 @@ final class AppStore {
         switch result {
         case .failure(let error):
             builderStatuses[link.baseURL] = .failed(error.localizedDescription)
+            // What it had is no longer known, so its pipelines don't claim to wait for a build.
+            for runner in pipelines where runner.config.builderURL == link.baseURL.absoluteString {
+                runner.remote = nil
+            }
         case .success(let catalog):
             let address = link.baseURL.absoluteString
             let addresses = Set(builders.map(\.baseURL.absoluteString))
@@ -292,6 +317,7 @@ final class AppStore {
             } else {
                 deviceSupportBuilders.remove(link.baseURL)
             }
+            catalogPipelines[link.baseURL] = Set(catalog.pipelines.map(\.id.uuidString))
             var known = knownRemotePipelines
             for shared in catalog.pipelines {
                 if let runner = pipelines.first(where: { $0.config.remoteID == shared.id }) {

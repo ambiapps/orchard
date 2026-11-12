@@ -299,4 +299,12 @@ private final class DownloadProgress: NSObject, URLSessionTaskDelegate, Sendable
         }
         state.withLockUnchecked { $0.observation = observation }
     }
+
+    /// The observation and this object hold on to each other until it's invalidated.
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        state.withLockUnchecked {
+            $0.observation?.invalidate()
+            $0.observation = nil
+        }
+    }
 }

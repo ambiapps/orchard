@@ -118,7 +118,7 @@ final class PipelineRunner: Identifiable {
 
     /// Whether the builder has this pipeline but hasn't built it for these devices yet.
     var isWaitingForBuild: Bool {
-        config.isRemote && remote != nil && remoteBuilds.isEmpty
+        config.isRemote && remote != nil && remoteBuilds.isEmpty && lastError == nil
     }
 
     /// The status as the window shows it.
