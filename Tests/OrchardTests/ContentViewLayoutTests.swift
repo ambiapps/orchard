@@ -95,15 +95,24 @@ struct ContentViewLayoutTests {
                 try settings.snapshot(to: directory.appendingPathComponent("settings-\(isOn ? "on" : "off")-\(name).png"))
             }
 
-            for state in ["builder", "client"] {
+            for state in ["builder", "client", "client-pairing"] {
                 let store = makeTestStore()
                 if state == "builder" {
                     store.sharesBuilds = true
+                    _ = store.clientAccess.check(token: "a", name: "Ada's MacBook Air")
+                    store.accessChanged(newRequest: nil)
+                    store.approve(store.pairingRequests[0], code: store.pairingRequests[0].code)
+                    _ = store.clientAccess.check(token: "g", name: "Grace's Mac mini", address: "192.168.1.24")
+                    store.accessChanged(newRequest: nil)
                 } else {
-                    store.builderLinks = ["http://office-mac.local:8642/#4f1c…", "http://studio.tailnet.ts.net:8642/#9ab2…"]
+                    store.builderLinks = ["http://office-mac.local:8642", "http://studio.tailnet.ts.net:8642"]
                     for (link, name) in zip(store.builders, ["Office Mac", "Studio"]) {
-                        store.sync(with: .success(BuildCatalog(builder: name, hasDeviceSupport: true, pipelines: [])),
-                                   from: link)
+                        if state == "client-pairing", name == "Studio" {
+                            store.sync(with: .failure(BuilderError.awaitingApproval), from: link)
+                        } else {
+                            store.sync(with: .success(BuildCatalog(builder: name, hasDeviceSupport: true, pipelines: [])),
+                                       from: link)
+                        }
                     }
                 }
                 let settings = WindowHarness(SettingsView().environment(store), size: NSSize(width: 460, height: 200),
@@ -157,7 +166,7 @@ struct ContentViewLayoutTests {
         let installed = deviceSupport == .installed
         let store = AppStore(defaults: nil, discoversDevices: false,
                              devices: installed ? [this, DiscoveredDevice(device: iPhone, isConnected: true)] : [this])
-        store.builderLinks = ["http://office-mac.local:8642/#token", "http://studio.local:8642/#token"]
+        store.builderLinks = ["http://office-mac.local:8642", "http://studio.local:8642"]
         let build = SharedBuild(platform: .iOS, commit: "5e1f0c2a9b7d4e6f8a1b3c5d7e9f0a2b4c6d8e0f",
                                 bundleIdentifier: "com.example.app", builtAt: Date().addingTimeInterval(-900))
         store.sync(with: .success(BuildCatalog(builder: "Office Mac", hasDeviceSupport: true, pipelines: [

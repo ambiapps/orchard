@@ -28,19 +28,18 @@ struct BuildCatalog: Codable, Sendable {
     var pipelines: [SharedPipeline]
 }
 
-/// The one string a client needs: `http://host:port/#token`.
+/// The address a client enters: `http://host:port`. Links from Orchard 1.0.15 and earlier end in
+/// `#token`; that part is ignored, because each client now gets its own token by being approved.
 struct BuilderLink: Hashable, Sendable {
     static let defaultPort = 8642
 
     var baseURL: URL
-    var token: String
 
-    /// Nil unless `string` has a host and a token. The scheme and port may be left out.
+    /// Nil unless `string` has a host. The scheme and port may be left out.
     init?(_ string: String) {
         var text = string.trimmingCharacters(in: .whitespacesAndNewlines)
         if !text.contains("://") { text = "http://" + text }
         guard var components = URLComponents(string: text), let host = components.host, !host.isEmpty,
-              let token = components.fragment, !token.isEmpty,
               components.scheme == "http" || components.scheme == "https"
         else { return nil }
         if components.port == nil, components.scheme == "http" { components.port = Self.defaultPort }
@@ -49,11 +48,10 @@ struct BuilderLink: Hashable, Sendable {
         components.query = nil
         guard let url = components.url else { return nil }
         baseURL = url
-        self.token = token
     }
 
-    static func string(host: String, port: Int, token: String) -> String {
-        "http://\(host):\(port)/#\(token)"
+    static func string(host: String, port: Int) -> String {
+        "http://\(host):\(port)"
     }
 
     static func newToken() -> String {
@@ -194,6 +192,8 @@ enum SharedBuilds {
 enum BuilderError: LocalizedError, Equatable {
     case notConnected
     case unauthorized
+    case declined
+    case awaitingApproval
     case notFound
     case status(Int)
     case notShared
@@ -204,7 +204,9 @@ enum BuilderError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notConnected: "This pipeline's builder isn't in Settings. Add its link there."
-        case .unauthorized: "The builder didn't accept the link's token."
+        case .unauthorized: "The builder didn't accept this Mac. If it runs Orchard 1.0.15 or earlier, update it there."
+        case .declined: "The builder declined this Mac."
+        case .awaitingApproval: "Waiting for the builder to approve this Mac."
         case .notFound: "The builder no longer has that build."
         case .status(let code): "The builder answered with HTTP \(code)."
         case .notShared: "The builder doesn't share this pipeline any more."
@@ -218,6 +220,7 @@ enum BuilderError: LocalizedError, Equatable {
 /// Talks to a builder's `BuildServer`.
 struct BuilderClient: Equatable, Sendable {
     var link: BuilderLink
+    var identity: ClientIdentity
 
     func catalog() async throws -> BuildCatalog {
         var request = request("v1/builds")
@@ -261,7 +264,10 @@ struct BuilderClient: Equatable, Sendable {
 
     private func request(_ path: String) -> URLRequest {
         var request = URLRequest(url: link.baseURL.appendingPathComponent(path))
-        request.setValue("Bearer \(link.token)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(identity.token)", forHTTPHeaderField: "Authorization")
+        // Lets the builder show who's asking.
+        let name = identity.name.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? ""
+        request.setValue(name, forHTTPHeaderField: ClientHeader.name)
         request.cachePolicy = .reloadIgnoringLocalCacheData
         return request
     }
@@ -269,7 +275,10 @@ struct BuilderClient: Equatable, Sendable {
     private func check(_ response: URLResponse) throws {
         switch (response as? HTTPURLResponse)?.statusCode ?? 0 {
         case 200: return
-        case 401: throw BuilderError.unauthorized
+        case 401:
+            let access = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: ClientHeader.access)
+            throw access == "declined" ? BuilderError.declined : BuilderError.unauthorized
+        case 403: throw BuilderError.awaitingApproval
         case 404: throw BuilderError.notFound
         case let code: throw BuilderError.status(code)
         }
@@ -307,4 +316,11 @@ private final class DownloadProgress: NSObject, URLSessionTaskDelegate, Sendable
             $0.observation = nil
         }
     }
+}
+
+/// The header a client sends its name in (percent-encoded), and the one a builder marks a
+/// declined client's 401 with.
+enum ClientHeader {
+    static let name = "X-Orchard-Client"
+    static let access = "X-Orchard-Access"
 }
