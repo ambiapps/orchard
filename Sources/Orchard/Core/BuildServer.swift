@@ -7,6 +7,8 @@ struct HTTPRequest: Equatable, Sendable {
     var path: String
     /// Names in lower case.
     var headers: [String: String] = [:]
+    /// The client's IP address, set by the server.
+    var remoteAddress: String?
 
     /// Parses a request head (the lines before the blank one); nil if it isn't one.
     static func parse(_ head: Data) -> HTTPRequest? {
@@ -42,6 +44,7 @@ struct HTTPResponse: Equatable, Sendable {
         case 200: "OK"
         case 400: "Bad Request"
         case 401: "Unauthorized"
+        case 403: "Forbidden"
         case 404: "Not Found"
         case 405: "Method Not Allowed"
         default: "Error"
@@ -49,16 +52,24 @@ struct HTTPResponse: Equatable, Sendable {
     }
 }
 
-/// What a builder serves, decided from the files `SharedBuilds` keeps. Every request needs the token.
+/// What a builder serves, decided from the files `SharedBuilds` keeps. Every request needs the
+/// token of a client the builder's user approved; any other token becomes a pairing request (403).
 struct BuildService: Sendable {
     var name: String
-    var token: String
+    var access: ClientAccess
     var root: URL = Paths.pipelines
     /// The package with `devicectl` from this Mac's Xcode, for clients that have no Xcode.
     var deviceSupport: URL?
 
     func response(to request: HTTPRequest) -> HTTPResponse {
-        guard request.headers["authorization"] == "Bearer \(token)" else { return .text(401, "Unauthorized") }
+        let authorization = request.headers["authorization"] ?? ""
+        let token = authorization.hasPrefix("Bearer ") ? String(authorization.dropFirst(7)) : nil
+        switch access.check(token: token, name: request.headers[ClientHeader.name.lowercased()]?.removingPercentEncoding,
+                            code: request.headers[ClientHeader.code.lowercased()], address: request.remoteAddress) {
+        case .allowed: break
+        case .pending: return .text(403, "Waiting for approval")
+        case .refused: return .text(401, "Unauthorized")
+        }
         guard request.method == "GET" else { return .text(405, "Method not allowed") }
         let parts = request.path.split(separator: "/").map(String.init)
         switch parts.count {
@@ -169,7 +180,8 @@ private final class Session: @unchecked Sendable {
             buffer.append(data ?? Data())
             if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
                 answered = true
-                let request = HTTPRequest.parse(buffer[..<end.lowerBound])
+                var request = HTTPRequest.parse(buffer[..<end.lowerBound])
+                if case .hostPort(let host, _) = connection.endpoint { request?.remoteAddress = Self.address(host) }
                 send(request.map(service.response) ?? .text(400, "Bad request"))
             } else if isComplete || error != nil || buffer.count > 65_536 {
                 connection.cancel()
@@ -177,6 +189,14 @@ private final class Session: @unchecked Sendable {
                 receive()
             }
         }
+    }
+
+    /// "192.168.1.20" rather than "::ffff:192.168.1.20%en0".
+    static func address(_ host: NWEndpoint.Host) -> String {
+        var text = "\(host)"
+        if let percent = text.firstIndex(of: "%") { text = String(text[..<percent]) }
+        if text.hasPrefix("::ffff:"), text.contains(".") { text.removeFirst(7) }
+        return text
     }
 
     private func send(_ response: HTTPResponse) {

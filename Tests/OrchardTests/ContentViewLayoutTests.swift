@@ -95,13 +95,20 @@ struct ContentViewLayoutTests {
                 try settings.snapshot(to: directory.appendingPathComponent("settings-\(isOn ? "on" : "off")-\(name).png"))
             }
 
-            for state in ["builder", "client"] {
+            for state in ["builder", "client", "client-pairing"] {
                 let store = makeTestStore()
                 if state == "builder" {
                     store.sharesBuilds = true
+                    _ = store.clientAccess.check(token: "a", name: "Ada's MacBook Air", code: "123456")
+                    store.accessChanged(newRequest: nil)
+                    store.approve(store.pairingRequests[0], code: "123456")
+                    _ = store.clientAccess.check(token: "g", name: "Grace's Mac mini", code: "042042",
+                                                 address: "192.168.1.24")
+                    store.accessChanged(newRequest: nil)
                 } else {
-                    store.builderLink = "http://office-mac.local:8642/#4f1c…"
-                    store.builderStatus = .connected(name: "Office Mac", pipelines: 2)
+                    store.builderLink = "http://office-mac.local:8642"
+                    store.builderStatus = state == "client"
+                        ? .connected(name: "Office Mac", pipelines: 2) : .awaitingApproval(code: "042042")
                 }
                 let settings = WindowHarness(SettingsView().environment(store), size: NSSize(width: 460, height: 200),
                                              appearance: appearance)
@@ -154,7 +161,7 @@ struct ContentViewLayoutTests {
         let installed = deviceSupport == .installed
         let store = AppStore(defaults: nil, discoversDevices: false,
                              devices: installed ? [this, DiscoveredDevice(device: iPhone, isConnected: true)] : [this])
-        store.builderLink = "http://office-mac.local:8642/#token"
+        store.builderLink = "http://office-mac.local:8642"
         store.sync(with: .success(BuildCatalog(builder: "Office Mac", hasDeviceSupport: true, pipelines: [
             SharedPipeline(id: UUID(), name: "Flightradar24", builds: []),
         ])))

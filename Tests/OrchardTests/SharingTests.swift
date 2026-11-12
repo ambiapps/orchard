@@ -20,25 +20,100 @@ struct SharingTests {
         HTTPRequest(method: method, path: path, headers: token.map { ["authorization": "Bearer \($0)"] } ?? [:])
     }
 
+    /// Access that lets in the token "secret".
+    private func approving(_ token: String = "secret") -> ClientAccess {
+        ClientAccess(approved: [ApprovedClient(name: "Client", tokenHash: ClientAccess.hash(token))])
+    }
+
     // MARK: Link
 
-    @Test func linkCarriesAddressAndToken() throws {
-        let link = try #require(BuilderLink(" http://office-mac.local:9000/#abc123 \n"))
+    @Test func linkIsTheBuildersAddress() throws {
+        let link = try #require(BuilderLink(" http://office-mac.local:9000/ \n"))
         #expect(link.baseURL.absoluteString == "http://office-mac.local:9000")
-        #expect(link.token == "abc123")
-        #expect(BuilderLink(BuilderLink.string(host: "mac.local", port: 8642, token: "t")) == BuilderLink("mac.local/#t"))
+        #expect(BuilderLink(BuilderLink.string(host: "mac.local", port: 8642)) == BuilderLink("mac.local"))
+    }
+
+    /// Links from 1.0.14 and earlier end in the builder's shared token, which no longer lets anyone in.
+    @Test func anOldLinksTokenIsIgnored() throws {
+        #expect(BuilderLink("http://office-mac.local:8642/#4f1c") == BuilderLink("office-mac.local"))
     }
 
     @Test func linkWithoutSchemeOrPortGetsTheDefaults() throws {
-        let link = try #require(BuilderLink("office-mac.tailnet.ts.net/#abc"))
+        let link = try #require(BuilderLink("office-mac.tailnet.ts.net"))
         #expect(link.baseURL.absoluteString == "http://office-mac.tailnet.ts.net:\(BuilderLink.defaultPort)")
     }
 
-    @Test func linkNeedsAHostAndAToken() {
+    @Test func linkNeedsAHost() {
         #expect(BuilderLink("") == nil)
-        #expect(BuilderLink("http://office-mac.local:8642/") == nil)
-        #expect(BuilderLink("ftp://office-mac.local/#abc") == nil)
+        #expect(BuilderLink("http://") == nil)
+        #expect(BuilderLink("ftp://office-mac.local") == nil)
         #expect(BuilderLink.newToken() != BuilderLink.newToken())
+    }
+
+    // MARK: Approval
+
+    @Test func aNewClientWaitsForItsCode() {
+        let access = ClientAccess()
+        #expect(access.check(token: "t", name: "Ada's Mac", code: "123456", address: "10.0.0.2") == .pending)
+        #expect(access.check(token: "t", name: "Ada's Mac", code: "123456") == .pending)
+        let request = try! #require(access.pairingRequests.first)
+        #expect(access.pairingRequests.count == 1)
+        #expect(request.name == "Ada's Mac")
+        #expect(!access.approve(request.id, code: "654321"))
+        #expect(access.check(token: "t", name: "Ada's Mac", code: "123456") == .pending)
+        #expect(access.approve(request.id, code: "123 456"))
+        #expect(access.pairingRequests.isEmpty)
+        #expect(access.check(token: "t", name: nil, code: nil) == .allowed)
+        #expect(access.approvedClients.map(\.name) == ["Ada's Mac"])
+        #expect(access.approvedClients.first?.tokenHash != "t")
+        #expect(access.check(token: "other", name: nil, code: nil) == .refused)
+    }
+
+    @Test func aRequestNeedsANameAndASixDigitCode() {
+        let access = ClientAccess()
+        #expect(access.check(token: nil, name: "Mac", code: "123456") == .refused)
+        #expect(access.check(token: "t", name: "Mac", code: nil) == .refused)
+        #expect(access.check(token: "t", name: "Mac", code: "12345") == .refused)
+        #expect(access.check(token: "t", name: "Mac", code: "12345x") == .refused)
+        #expect(access.check(token: "t", name: " ", code: "123456") == .refused)
+        #expect(access.pairingRequests.isEmpty)
+    }
+
+    @Test func aDeclinedClientIsRefusedAndARemovedOneAsksAgain() throws {
+        let access = ClientAccess()
+        _ = access.check(token: "no", name: "Stranger", code: "111111")
+        access.decline(try #require(access.pairingRequests.first).id)
+        #expect(access.check(token: "no", name: "Stranger", code: "111111") == .refused)
+        #expect(access.pairingRequests.isEmpty)
+
+        _ = access.check(token: "yes", name: "Ada's Mac", code: "222222")
+        #expect(access.approve(try #require(access.pairingRequests.first).id, code: "222222"))
+        access.remove(try #require(access.approvedClients.first).id)
+        #expect(access.check(token: "yes", name: "Ada's Mac", code: "222222") == .pending)
+    }
+
+    @Test func oldAndExcessRequestsAreDropped() {
+        let access = ClientAccess()
+        let start = Date()
+        _ = access.check(token: "gone", name: "Gone", code: "000000", now: start)
+        for index in 0..<ClientAccess.maxRequests {
+            _ = access.check(token: "t\(index)", name: "Mac \(index)", code: "123456",
+                             now: start.addingTimeInterval(ClientAccess.requestLifetime + 1 + Double(index)))
+        }
+        #expect(!access.pairingRequests.contains { $0.name == "Gone" })
+        #expect(access.pairingRequests.count == ClientAccess.maxRequests)
+        _ = access.check(token: "new", name: "New", code: "123456", now: start.addingTimeInterval(ClientAccess.requestLifetime + 20))
+        #expect(access.pairingRequests.count == ClientAccess.maxRequests)
+        #expect(access.pairingRequests.contains { $0.name == "New" })
+        #expect(!access.pairingRequests.contains { $0.name == "Mac 0" })
+    }
+
+    @Test func codesAreSixDigits() {
+        for _ in 0..<50 {
+            let identity = ClientIdentity.new(name: "Mac")
+            #expect(identity.code.count == 6 && identity.code.allSatisfy(\.isNumber))
+        }
+        #expect(ClientIdentity.format("012345") == "012 345")
     }
 
     // MARK: HTTP
@@ -52,7 +127,7 @@ struct SharingTests {
 
     @Test func everyRequestNeedsTheToken() throws {
         let root = try TemporaryDirectory()
-        let service = BuildService(name: "Builder", token: "secret", root: root.url, deviceSupport: nil)
+        let service = BuildService(name: "Builder", access: approving(), root: root.url, deviceSupport: nil)
         #expect(service.response(to: get("/v1/builds", token: nil)).status == 401)
         #expect(service.response(to: get("/v1/builds", token: "wrong")).status == 401)
         #expect(service.response(to: get("/v1/builds")).status == 200)
@@ -65,7 +140,7 @@ struct SharingTests {
         let root = try TemporaryDirectory()
         let pipeline = PipelineConfig(name: "App")
         let product = try makeApp(in: root)
-        let service = BuildService(name: "Builder", token: "secret", root: root.url, deviceSupport: nil)
+        let service = BuildService(name: "Builder", access: approving(), root: root.url, deviceSupport: nil)
         let first = try await SharedBuilds.publish(product, platform: .iOS, commit: commit, subject: "One",
                                                    pipeline: pipeline, root: root.url)
         func path(_ build: SharedBuild) -> String { "/v1/builds/\(pipeline.id.uuidString)/\(build.id.uuidString).zip" }
@@ -102,12 +177,14 @@ struct SharingTests {
     // MARK: Server and client
 
     /// A builder serving `root` on a free port, and a client connected to it.
-    private func startServer(root: URL, token: String = "secret") async throws -> (BuildServer, BuilderClient) {
+    private func startServer(root: URL, token: String = "secret",
+                             access: ClientAccess? = nil) async throws -> (BuildServer, BuilderClient) {
         let server = try BuildServer(
-            service: BuildService(name: "Office Mac", token: "secret", root: root, deviceSupport: nil), port: 0)
+            service: BuildService(name: "Office Mac", access: access ?? approving(), root: root, deviceSupport: nil),
+            port: 0)
         let port = try await server.start()
-        let link = try #require(BuilderLink("http://127.0.0.1:\(port)/#\(token)"))
-        return (server, BuilderClient(link: link))
+        let link = try #require(BuilderLink("http://127.0.0.1:\(port)"))
+        return (server, BuilderClient(link: link, identity: ClientIdentity(token: token, code: "123456", name: "Client")))
     }
 
     @Test func clientDownloadsWhatTheBuilderBuilt() async throws {
@@ -131,10 +208,29 @@ struct SharingTests {
         #expect(try String(contentsOf: product.appURL.appendingPathComponent("binary"), encoding: .utf8) == "contents")
     }
 
-    @Test func aWrongTokenIsRefused() async throws {
+    @Test func aClientGetsBuildsOnceTheBuilderEntersItsCode() async throws {
         let root = try TemporaryDirectory()
-        let (server, client) = try await startServer(root: root.url, token: "wrong")
+        let access = ClientAccess()
+        let (server, unknown) = try await startServer(root: root.url, token: "new", access: access)
         defer { server.stop() }
+        var client = unknown
+        client.identity = ClientIdentity(token: "new", code: "042042", name: "César's MacBook")
+        await #expect(throws: BuilderError.awaitingApproval) { try await client.catalog() }
+        let request = try #require(access.pairingRequests.first)
+        #expect(request.name == "César's MacBook")
+        #expect(request.code == "042042")
+        #expect(request.address == "127.0.0.1")
+        #expect(access.approve(request.id, code: "042 042"))
+        #expect(try await client.catalog().builder == "Office Mac")
+    }
+
+    @Test func aDeclinedClientIsRefused() async throws {
+        let root = try TemporaryDirectory()
+        let access = ClientAccess()
+        let (server, client) = try await startServer(root: root.url, token: "wrong", access: access)
+        defer { server.stop() }
+        await #expect(throws: BuilderError.awaitingApproval) { try await client.catalog() }
+        access.decline(try #require(access.pairingRequests.first).id)
         await #expect(throws: BuilderError.unauthorized) { try await client.catalog() }
     }
 
@@ -255,7 +351,7 @@ struct SharingTests {
 
     @Test func builderPipelinesAreAddedOnce() throws {
         let store = makeTestStore(pipelines: 0)
-        store.builderLink = "office-mac.local/#token"
+        store.builderLink = "office-mac.local"
         let shared = SharedPipeline(id: UUID(), name: "Flightradar24", builds: [])
         let catalog = BuildCatalog(builder: "Office Mac", hasDeviceSupport: true, pipelines: [shared])
         store.sync(with: .success(catalog))
@@ -272,16 +368,67 @@ struct SharingTests {
         #expect(store.pipelines.isEmpty)
         store.builderLink = ""
         #expect(store.builderStatus == .none)
-        store.builderLink = "office-mac.local/#token"
+        store.builderLink = "office-mac.local"
         store.sync(with: .success(catalog))
         #expect(store.pipelines.count == 1)
     }
 
     @Test func aBadLinkIsReported() {
         let store = makeTestStore(pipelines: 0)
-        store.builderLink = "office-mac.local"
+        store.builderLink = "ftp://office-mac.local"
         #expect(store.builderStatus == .invalidLink)
         #expect(store.builder == nil)
+    }
+
+    @Test func aClientShowsItsCodeUntilApproved() throws {
+        let store = makeTestStore(pipelines: 0)
+        store.builderLink = "office-mac.local"
+        let identity = try #require(store.builderIdentity)
+        #expect(store.builder?.identity == identity)
+        store.sync(with: .failure(BuilderError.awaitingApproval))
+        #expect(store.builderStatus == .awaitingApproval(code: identity.code))
+
+        // Editing the link to the same builder keeps the code; another builder gets a new one.
+        store.builderLink = "http://office-mac.local:8642"
+        #expect(store.builderIdentity == identity)
+        store.builderLink = "build-mac.local"
+        #expect(store.builderIdentity?.token != identity.token)
+
+        store.sync(with: .failure(BuilderError.unauthorized))
+        #expect(store.builderStatus == .declined)
+        let declined = try #require(store.builderIdentity)
+        store.requestApprovalAgain()
+        #expect(store.builderIdentity?.token != declined.token)
+        #expect(store.builder?.identity == store.builderIdentity)
+        #expect(store.builderStatus == .connecting)
+    }
+
+    @Test func theBuilderApprovesWithTheCode() throws {
+        let store = makeTestStore(pipelines: 0)
+        #expect(store.clientAccess.check(token: "t", name: "Ada's Mac", code: "123456") == .pending)
+        store.accessChanged(newRequest: nil)
+        let request = try #require(store.pairingRequests.first)
+        #expect(!store.approve(request, code: "000000"))
+        #expect(store.approvedClients.isEmpty)
+        #expect(store.approve(request, code: "123456"))
+        #expect(store.pairingRequests.isEmpty)
+        #expect(store.approvedClients.map(\.name) == ["Ada's Mac"])
+        store.removeClient(store.approvedClients[0])
+        #expect(store.approvedClients.isEmpty)
+    }
+
+    /// Approved clients are saved, so a builder that relaunches still knows them.
+    @Test func approvedClientsAreSaved() throws {
+        let suite = "OrchardTests.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = AppStore(defaults: defaults, discoversDevices: false)
+        _ = store.clientAccess.check(token: "t", name: "Ada's Mac", code: "123456")
+        store.accessChanged(newRequest: nil)
+        #expect(store.approve(try #require(store.pairingRequests.first), code: "123456"))
+        let relaunched = AppStore(defaults: defaults, discoversDevices: false)
+        #expect(relaunched.approvedClients.map(\.name) == ["Ada's Mac"])
+        #expect(relaunched.clientAccess.check(token: "t", name: nil, code: nil) == .allowed)
     }
 
     // MARK: Config

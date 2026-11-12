@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import SystemConfiguration
 
 @MainActor
 @Observable
@@ -41,16 +42,23 @@ final class AppStore {
     }
     /// Why the builder isn't serving, e.g. its port is taken.
     private(set) var sharingError: String?
-    /// What clients paste into their Settings: this Mac's address and the token.
+    /// What clients paste into their Settings: this Mac's address.
     var sharingLink: String {
-        BuilderLink.string(host: ProcessInfo.processInfo.hostName, port: BuilderLink.defaultPort, token: sharingToken)
+        BuilderLink.string(host: ProcessInfo.processInfo.hostName, port: BuilderLink.defaultPort)
     }
+    /// Macs that may download this Mac's builds, and those waiting for the user to enter their code.
+    private(set) var approvedClients: [ApprovedClient] = []
+    private(set) var pairingRequests: [PairingRequest] = []
 
     enum BuilderStatus: Equatable {
         case none
         case invalidLink
         case connecting
         case connected(name: String, pipelines: Int)
+        /// The builder's user has to enter `code` to approve this Mac.
+        case awaitingApproval(code: String)
+        /// The builder declined this Mac or removed it; `requestApprovalAgain()` starts over.
+        case declined
         case failed(String)
     }
     /// Client: the link of the builder to install builds from; empty for none.
@@ -62,12 +70,26 @@ final class AppStore {
             let link = BuilderLink(builderLink)
             guard link != BuilderLink(oldValue) || link == nil else { return }
             // Pipelines removed here come back when the link is entered again.
-            if link?.baseURL != BuilderLink(oldValue)?.baseURL { knownRemotePipelines = [] }
+            if link?.baseURL != BuilderLink(oldValue)?.baseURL {
+                knownRemotePipelines = []
+                // Another builder approves this Mac on its own, with a new token and code.
+                builderIdentity = link == nil ? nil : .new(name: Self.computerName)
+            }
             updateBuilder()
         }
     }
     var builderStatus: BuilderStatus = .none
-    var builder: BuilderClient? { BuilderLink(builderLink).map(BuilderClient.init) }
+    var builder: BuilderClient? {
+        guard let link = BuilderLink(builderLink), let builderIdentity else { return nil }
+        return BuilderClient(link: link, identity: builderIdentity)
+    }
+    /// This Mac's token and code for the builder in `builderLink`.
+    private(set) var builderIdentity: ClientIdentity? {
+        didSet {
+            guard builderIdentity != oldValue else { return }
+            defaults?.set(builderIdentity.flatMap { try? JSONEncoder().encode($0) }, forKey: builderIdentityKey)
+        }
+    }
 
     enum DeviceSupportState: Equatable {
         case installed
@@ -91,18 +113,20 @@ final class AppStore {
     @ObservationIgnored private let automaticSetupKey = "setsUpDevicesAutomatically"
     @ObservationIgnored private let onboardingKey = "onboardingDevices"
     @ObservationIgnored private let sharesBuildsKey = "sharesBuilds"
-    @ObservationIgnored private let sharingTokenKey = "sharingToken"
+    @ObservationIgnored private let approvedClientsKey = "approvedClients"
+    @ObservationIgnored private let builderIdentityKey = "builderIdentity"
     @ObservationIgnored private let builderLinkKey = "builderLink"
     @ObservationIgnored private let knownRemoteKey = "knownBuilderPipelines"
     @ObservationIgnored private var server: BuildServer?
     @ObservationIgnored private var serverTask: Task<Void, Never>?
     @ObservationIgnored private var builderTask: Task<Void, Never>?
-    @ObservationIgnored private lazy var sharingToken: String = {
-        if let token = defaults?.string(forKey: sharingTokenKey) { return token }
-        let token = BuilderLink.newToken()
-        defaults?.set(token, forKey: sharingTokenKey)
-        return token
-    }()
+    /// Decides which clients the server lets in; lives as long as the store, across server restarts.
+    @ObservationIgnored private(set) lazy var clientAccess: ClientAccess = ClientAccess(
+        approved: defaults?.data(forKey: approvedClientsKey)
+            .flatMap { try? JSONDecoder().decode([ApprovedClient].self, from: $0) } ?? []
+    ) { [weak self] request in
+        Task { @MainActor in self?.accessChanged(newRequest: request) }
+    }
     /// The builder's pipelines this Mac has added, so one the user deleted isn't added again.
     @ObservationIgnored private var knownRemotePipelines: Set<String> {
         get { Set(defaults?.stringArray(forKey: knownRemoteKey) ?? inMemoryKnownRemote) }
@@ -115,6 +139,8 @@ final class AppStore {
 
     /// How often a client asks its builder which pipelines it shares.
     static let builderPollInterval: Duration = .seconds(60)
+    /// How often a client asks while it waits for the builder's user to approve it.
+    static let approvalPollInterval: Duration = .seconds(3)
     @ObservationIgnored private var activity: NSObjectProtocol?
     @ObservationIgnored private let discoversDevices: Bool
     @ObservationIgnored private let commands: DeviceOnboarding.Commands
@@ -144,6 +170,12 @@ final class AppStore {
         sharesBuilds = defaults?.bool(forKey: sharesBuildsKey) ?? false
         hasXcode = discoversDevices ? DeviceSupport.hasXcode : true
         builderLink = defaults?.string(forKey: builderLinkKey) ?? ""
+        builderIdentity = defaults?.data(forKey: builderIdentityKey)
+            .flatMap { try? JSONDecoder().decode(ClientIdentity.self, from: $0) }
+        if builderIdentity == nil, BuilderLink(builderLink) != nil { builderIdentity = .new(name: Self.computerName) }
+        // Builders up to 1.0.14 let in anyone with this token; clients now have to be approved.
+        defaults?.removeObject(forKey: "sharingToken")
+        approvedClients = clientAccess.approvedClients
         if setsUpDevicesAutomatically {
             // The real state comes with the first poll.
             for id in defaults?.stringArray(forKey: onboardingKey) ?? [] { onboarding[id] = .unreachable }
@@ -169,7 +201,7 @@ final class AppStore {
         server = nil
         sharingError = nil
         guard sharesBuilds else { return }
-        let service = BuildService(name: Host.current().localizedName ?? "Builder", token: sharingToken,
+        let service = BuildService(name: Self.computerName, access: clientAccess,
                                    deviceSupport: DeviceSupport.package())
         serverTask = Task { [weak self] in
             // The port of a server that was just stopped takes a moment to come free, so a
@@ -210,7 +242,9 @@ final class AppStore {
                 do { result = .success(try await builder.catalog()) } catch { result = .failure(error) }
                 guard let self, !Task.isCancelled else { return }
                 self.sync(with: result)
-                try? await Task.sleep(for: Self.builderPollInterval)
+                // While the builder's user enters the code, the answer should come quickly.
+                let waiting = if case .awaitingApproval = self.builderStatus { true } else { false }
+                try? await Task.sleep(for: waiting ? Self.approvalPollInterval : Self.builderPollInterval)
             }
         }
     }
@@ -219,6 +253,10 @@ final class AppStore {
     /// start disabled, with no devices: the user picks devices and enables them.
     func sync(with result: Result<BuildCatalog, Error>) {
         switch result {
+        case .failure(BuilderError.awaitingApproval):
+            builderStatus = .awaitingApproval(code: builderIdentity?.code ?? "")
+        case .failure(BuilderError.unauthorized):
+            builderStatus = .declined
         case .failure(let error):
             builderStatus = .failed(error.localizedDescription)
         case .success(let catalog):
@@ -236,6 +274,54 @@ final class AppStore {
             }
             if known != knownRemotePipelines { knownRemotePipelines = known }
         }
+    }
+
+    /// After the builder declined or removed this Mac: asks again, with a new token and code.
+    func requestApprovalAgain() {
+        guard BuilderLink(builderLink) != nil else { return }
+        builderIdentity = .new(name: Self.computerName)
+        updateBuilder()
+    }
+
+    /// Lets the Mac behind `request` download builds, if `code` is the one it shows.
+    @discardableResult
+    func approve(_ request: PairingRequest, code: String) -> Bool {
+        let approved = clientAccess.approve(request.id, code: code)
+        if approved { log("Approved \(request.name) to download builds") }
+        accessChanged(newRequest: nil)
+        return approved
+    }
+
+    func decline(_ request: PairingRequest) {
+        clientAccess.decline(request.id)
+        log("Declined \(request.name)")
+        accessChanged(newRequest: nil)
+    }
+
+    func removeClient(_ client: ApprovedClient) {
+        clientAccess.remove(client.id)
+        log("Removed \(client.name); it can no longer download builds")
+        accessChanged(newRequest: nil)
+    }
+
+    /// Mirrors `clientAccess` for the UI and saves the approved clients.
+    func accessChanged(newRequest: PairingRequest?) {
+        let approved = clientAccess.approvedClients
+        if approved != approvedClients {
+            approvedClients = approved
+            defaults?.set(try? JSONEncoder().encode(approved), forKey: approvedClientsKey)
+        }
+        pairingRequests = clientAccess.pairingRequests
+        if let newRequest, discoversDevices {
+            log("\(newRequest.name) asks to download builds")
+            Notifier.post(title: "\(newRequest.name) wants this Mac's builds",
+                          body: "To let it in, enter the code it shows in Orchard's Settings.")
+        }
+    }
+
+    /// The name people gave this Mac, e.g. "Office Mac".
+    static var computerName: String {
+        (SCDynamicStoreCopyComputerName(nil, nil) as String?) ?? Host.current().localizedName ?? "Mac"
     }
 
     /// Downloads the builder's device support package and installs it, so this Mac can install
