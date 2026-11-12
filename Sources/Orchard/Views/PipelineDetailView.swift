@@ -57,9 +57,19 @@ struct PipelineSettingsView: View {
 
             if runner.config.isRemote {
                 Section("Source") {
-                    LabeledContent("Builder", value: builderName)
-                    if let head = runner.remoteHead {
-                        LabeledContent("Latest build", value: head.shortSHA).monospaced()
+                    LabeledContent("Builder", value: runner.config.builderLabel ?? "None")
+                    if let build = runner.remoteBuilds.first {
+                        LabeledContent("Latest build") {
+                            HStack(spacing: 4) {
+                                Text(build.commit.shortSHA).monospaced()
+                                Text(build.builtAt, style: .relative) + Text(" ago")
+                            }
+                        }
+                    } else if runner.isWaitingForBuild {
+                        LabeledContent("Latest build", value: "None yet")
+                    }
+                    if case .downloading = runner.status, let progress = runner.downloadProgress {
+                        ProgressView(value: progress) { Text("Downloading") }
                     }
                 }
             } else {
@@ -100,17 +110,11 @@ struct PipelineSettingsView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(runner.config.name)
-        .navigationSubtitle(runner.status.label)
+        .navigationSubtitle(runner.statusLabel)
         .task(id: runner.config.repoPath) { await loadRepository() }
         .task(id: [runner.config.repoPath, runner.config.containerPath].compactMap { $0 }) { await loadSchemes() }
     }
 
-    private var builderName: String {
-        if case .connected(let name, _) = store.builderStatus { return name }
-        return store.builder?.link.baseURL.host() ?? "None"
-    }
-
-    /// The sections of a pipeline that builds a repository on this Mac.
     @ViewBuilder
     private var localSections: some View {
             Section("Source") {

@@ -59,6 +59,11 @@ final class PipelineRunner: Identifiable {
     private(set) var nextCheck: Date?
     private(set) var lastError: String?
     private(set) var remoteHead: String?
+    /// What the builder shares of a remote pipeline, as of its last answer; nil when it hasn't
+    /// answered or doesn't have the pipeline. Also set by `AppStore`, which asks for all pipelines.
+    var remote: SharedPipeline?
+    /// How much of the build being downloaded has arrived, 0 to 1.
+    private(set) var downloadProgress: Double?
 
     @ObservationIgnored var onChange: (() -> Void)?
     @ObservationIgnored private var loopTask: Task<Void, Never>?
@@ -72,6 +77,8 @@ final class PipelineRunner: Identifiable {
     /// The builder a remote pipeline (`config.remoteID`) gets its builds from. Set by `AppStore`.
     @ObservationIgnored var builder: BuilderClient?
     @ObservationIgnored private let sharedRoot: URL
+    /// Whether the log already says this pipeline is waiting for its builder's first build.
+    @ObservationIgnored private var saidWaiting = false
 
     /// Installs and launches an app on a device, logging the tools' output line by line.
     typealias DeployAction = @Sendable (BuiltProduct, Device, @escaping @Sendable (String) -> Void) async throws -> Void
@@ -99,6 +106,29 @@ final class PipelineRunner: Identifiable {
     }
 
     var lastRun: RunRecord? { runs.first }
+
+    /// The builder's builds for this pipeline's devices, newest first; of any platform while
+    /// no device is chosen.
+    var remoteBuilds: [SharedBuild] {
+        let platforms = Set(config.devices.map(\.platform))
+        return (remote?.builds ?? [])
+            .filter { platforms.isEmpty || platforms.contains($0.platform) }
+            .sorted { $0.builtAt > $1.builtAt }
+    }
+
+    /// Whether the builder has this pipeline but hasn't built it for these devices yet.
+    var isWaitingForBuild: Bool {
+        config.isRemote && remote != nil && remoteBuilds.isEmpty
+    }
+
+    /// The status as the window shows it.
+    var statusLabel: String {
+        if case .downloading = status, let downloadProgress {
+            return "\(status.label) \(Int(downloadProgress * 100))%"
+        }
+        if isWaitingForBuild, !status.isBusy { return config.isEnabled ? "Waiting for a build" : "No build yet" }
+        return status.label
+    }
 
     // MARK: Control
 
@@ -413,15 +443,23 @@ final class PipelineRunner: Identifiable {
             guard let builder else { throw BuilderError.notConnected }
             let catalog = try await builder.catalog()
             lastCheck = Date()
-            guard let shared = catalog.pipelines.first(where: { $0.id == remoteID }) else { throw BuilderError.notShared }
+            remote = catalog.pipelines.first { $0.id == remoteID }
+            guard let shared = remote else { throw BuilderError.notShared }
             func builds(for devices: [Device]) -> [SharedBuild] {
                 let platforms = Set(devices.map(\.platform))
                 return shared.builds.filter { platforms.contains($0.platform) }.sorted { $0.builtAt > $1.builtAt }
             }
             let wanted = builds(for: config.devices)
-            guard let newest = wanted.first else { throw BuilderError.noBuild }
-            remoteHead = newest.commit
             lastError = nil
+            guard let newest = wanted.first else {
+                // Not an error: the builder has the pipeline and hasn't built it yet. Said once.
+                remoteHead = nil
+                if !saidWaiting { append(.info, "Waiting for \(catalog.builder) to build this pipeline") }
+                saidWaiting = true
+                return
+            }
+            saidWaiting = false
+            remoteHead = newest.commit
             // Build ids, not commits: the builder may build a commit again with a new profile.
             // Each platform is followed by itself, because the builder publishes them minutes apart.
             let tried = Set((config.lastRemoteBuild ?? "").split(separator: ",").map(String.init))
@@ -460,6 +498,7 @@ final class PipelineRunner: Identifiable {
                 append(.error, "Couldn't get builds: \(error.localizedDescription)")
             }
             lastError = error.localizedDescription
+            saidWaiting = false
         }
     }
 
@@ -497,7 +536,16 @@ final class PipelineRunner: Identifiable {
                 append(.step, "Downloading \(build.commit.shortSHA) for \(platform.displayName) (\(build.size.formattedSize))")
                 let downloadStart = Date()
                 let archive = downloads.appendingPathComponent("\(platform.rawValue).zip")
-                try await builder.download(build, pipeline: remoteID, to: archive)
+                downloadProgress = 0
+                defer { downloadProgress = nil }
+                try await builder.download(build, pipeline: remoteID, to: archive) { [weak self] fraction in
+                    Task { @MainActor in
+                        // These arrive out of order, and the last ones after the download is over.
+                        guard let self, let shown = self.downloadProgress else { return }
+                        self.downloadProgress = max(shown, fraction)
+                    }
+                }
+                downloadProgress = nil
                 let product = try await SharedBuilds.unpack(
                     archive, into: downloads.appendingPathComponent(platform.rawValue, isDirectory: true))
                 try? FileManager.default.removeItem(at: archive)

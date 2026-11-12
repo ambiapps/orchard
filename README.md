@@ -50,9 +50,9 @@ Orchard checks `devicectl list devices` every 10 seconds, pairs a device that sh
 
 One Mac builds; other Macs install its builds on their own devices, without Xcode, the source code or git access. That suits designers and testers, also remote ones.
 
-**On the builder** (the Mac that has pipelines), turn on **Settings → Share builds with other Macs**. From the next build on, each pipeline's app is also zipped and served on port 8642. Settings shows a link, `http://<host>:8642/#<token>`: send it to the clients. For people outside the office network, replace the host with a name they can reach over your VPN or Tailscale. To build iOS when the builder itself has no iPhone chosen, set the pipeline's **Also build for**.
+**On the builder** (the Mac that has pipelines), turn on **Settings → Share builds with other Macs**. Clients see all of the builder's pipelines right away, and from the next build on, each pipeline's app is also zipped and served on port 8642. Settings shows a link, `http://<host>:8642/#<token>`: send it to the clients. For people outside the office network, replace the host with a name they can reach over your VPN or Tailscale. To build iOS when the builder itself has no iPhone chosen, set the pipeline's **Also build for**.
 
-**On a client**, paste the link into **Settings → Builder link**. The builder's pipelines appear in the main window; choose your devices and enable them. Orchard then asks the builder for new builds (every minute by default), downloads each one and installs and launches it.
+**On a client**, paste the link into **Settings → Builder link**; **Add Builder** takes more links, one per builder. Each builder's pipelines appear in the main window with the builder's name under them; choose your devices and enable them. Orchard then asks the builder for new builds (every minute by default), downloads each one, showing how far along it is, and installs and launches it. A pipeline the builder hasn't built yet says it's waiting for a build.
 
 A client needs no Xcode. `devicectl` comes from a 150 MB Apple-signed package inside the builder's Xcode (`XcodeSystemResources.pkg`); the device list offers to **Install…** it from the builder, after checking Apple's signature, and macOS asks for an administrator password. To pair a phone with a client, turn on **Set up connected devices automatically** there and plug it in.
 
@@ -72,7 +72,7 @@ Things to know:
 - If the app installs but can't launch (for example, the phone is locked), the deploy shows a warning instead of failing and counts as deployed.
 - When a device fails or the app doesn't launch on it (disconnected, locked), click its name in the deploy to install and launch the same build on it again, without rebuilding. That works for the most recent build, until the next one starts.
 - Each deploy lists the commits it brings in since the last successful deploy (`git log <last>..<new>`, up to 50). Nothing is listed when the new commit doesn't descend from the last one (force-push, rollback, branch switch).
-- Full logs per run are in `~/Library/Logs/Orchard/<id>/`. The deploy list and the log in the window are kept there too (`runs.json`, `activity.jsonl`), so they survive a relaunch. Both keep the last 20 builds (set per pipeline under Polling; lowering it trims right away), and both show how long checkout, build and deploy took.
+- Full logs per run are in `~/Library/Logs/Orchard/<id>/`. The deploy list and the log in the window are kept there too (`runs.json`, `activity.jsonl`), so they survive a relaunch. Both keep the last 5 builds (set per pipeline under Polling; lowering it trims right away), and both show how long checkout, build and deploy took.
 
 ## Requirements
 
