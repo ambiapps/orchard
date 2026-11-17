@@ -74,13 +74,15 @@ enum Provisioning {
         }
     }
 
-    /// The ids of the devices among `devices` that the newest build of their platform in `runs`
-    /// (newest first) can't be installed on. A platform with no build at hand has nothing to check.
-    static func unprovisioned(_ devices: [Device], runs: [RunRecord]) -> Set<String> {
+    /// The ids of the devices among `devices` that the app built for their platform can't be
+    /// installed on. A platform with no app at hand, or one that needs no provisioning, has
+    /// nothing to check.
+    static func unprovisioned(_ devices: [Device], apps: [BuildPlatform: URL]) -> Set<String> {
         var result: Set<String> = []
-        for (platform, group) in Dictionary(grouping: devices.filter { $0.kind == .physical }, by: \.platform) {
-            guard let product = runs.lazy.compactMap({ $0.product(for: platform) }).first else { continue }
-            result.formUnion(devicesMissing(fromProfilesIn: product.appURL, devices: group).map(\.id))
+        let physical = devices.filter { $0.kind == .physical && $0.platform.needsDeviceProvisioning }
+        for (platform, group) in Dictionary(grouping: physical, by: \.platform) {
+            guard let app = apps[platform] else { continue }
+            result.formUnion(devicesMissing(fromProfilesIn: app, devices: group).map(\.id))
         }
         return result
     }

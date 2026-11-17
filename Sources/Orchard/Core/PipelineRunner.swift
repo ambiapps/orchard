@@ -62,6 +62,10 @@ final class PipelineRunner: Identifiable {
     /// Chosen devices the newest build of their platform isn't provisioned for, by id, so the
     /// device list can warn before a deploy fails.
     private(set) var unprovisionedDevices: Set<String> = []
+    /// The newest app of each platform and the run that made it. Kept while a new run builds or
+    /// downloads (which forgets older runs' products), and when that fails, so the warning
+    /// doesn't go away until a new app is there.
+    @ObservationIgnored private var checkedApps: [BuildPlatform: (run: RunRecord.ID, app: URL)] = [:]
     /// What `unprovisionedDevices` was worked out from, so profiles are read again only when a
     /// build or the chosen devices change, not on every update of a run.
     @ObservationIgnored private var provisioningInputs: [String]?
@@ -119,12 +123,18 @@ final class PipelineRunner: Identifiable {
     var lastRun: RunRecord? { runs.first }
 
     private func checkProvisioning() {
-        let inputs = config.devices.map { "\($0.id) \($0.udid ?? "")" } + runs.flatMap { run in
-            (run.products ?? [:]).map { "\(run.id) \($0.key) \($0.value.appURL.path)" }.sorted()
+        // Runs are newest first; going oldest to newest leaves each platform its newest app.
+        for run in runs.reversed() {
+            for (key, product) in run.products ?? [:] {
+                guard let platform = BuildPlatform(rawValue: key) else { continue }
+                checkedApps[platform] = (run.id, product.appURL)
+            }
         }
+        let inputs = config.devices.map { "\($0.id) \($0.udid ?? "")" }
+            + checkedApps.map { "\($0.key.rawValue) \($0.value.run) \($0.value.app.path)" }.sorted()
         guard inputs != provisioningInputs else { return }
         provisioningInputs = inputs
-        let ids = Provisioning.unprovisioned(config.devices, runs: runs)
+        let ids = Provisioning.unprovisioned(config.devices, apps: checkedApps.mapValues(\.app))
         if ids != unprovisionedDevices { unprovisionedDevices = ids }
     }
 
