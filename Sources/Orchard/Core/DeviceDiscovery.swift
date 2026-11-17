@@ -99,9 +99,9 @@ enum DeviceDiscovery {
             case "pairingInProgress": pairing = .inProgress
             default: return nil
             }
-            // A device that isn't paired yet may not report its hardware; only simulators are ruled out.
-            guard pairing == .paired ? hardware?.reality == "physical" : hardware?.reality != "simulated"
-            else { return nil }
+            // Only simulators are ruled out. A device may not say it's physical: one that isn't paired
+            // yet, and on a Mac without Xcode a paired one until its tunnel is up.
+            guard hardware?.reality != "simulated" else { return nil }
             let platform = hardware?.platform.flatMap { BuildPlatform(devicePlatform: $0, simulator: false) }
             guard let platform = platform ?? (pairing == .paired ? nil : .iOS) else { return nil }
 
