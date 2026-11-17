@@ -257,6 +257,12 @@ private struct DevicesSection: View {
                             Text(detail(for: row))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if isSelected(row.device), runner.unprovisionedDevices.contains(row.id) {
+                                Label("Not in the latest build's provisioning profile", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .help("Installing will fail. Register the device's UDID in the developer account, then build again.")
+                            }
                         }
                     }
                 }

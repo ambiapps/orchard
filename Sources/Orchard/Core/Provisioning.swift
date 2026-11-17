@@ -74,6 +74,17 @@ enum Provisioning {
         }
     }
 
+    /// The ids of the devices among `devices` that the newest build of their platform in `runs`
+    /// (newest first) can't be installed on. A platform with no build at hand has nothing to check.
+    static func unprovisioned(_ devices: [Device], runs: [RunRecord]) -> Set<String> {
+        var result: Set<String> = []
+        for (platform, group) in Dictionary(grouping: devices.filter { $0.kind == .physical }, by: \.platform) {
+            guard let product = runs.lazy.compactMap({ $0.product(for: platform) }).first else { continue }
+            result.formUnion(devicesMissing(fromProfilesIn: product.appURL, devices: group).map(\.id))
+        }
+        return result
+    }
+
     /// Whether a profile in `app` that lacks one of `devices` is one Xcode manages, so deleting
     /// the cached copy and building again can produce a current one. A hand-made profile can't
     /// be refreshed that way.

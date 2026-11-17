@@ -42,6 +42,7 @@ final class PipelineRunner: Identifiable {
         didSet {
             guard config != oldValue else { return }
             onChange?()
+            checkProvisioning()
             if config.isEnabled != oldValue.isEnabled { config.isEnabled ? start() : stop() }
             if config.keptRuns < oldValue.keptRuns {
                 runs = Array(runs.prefix(config.keptRuns))
@@ -53,8 +54,17 @@ final class PipelineRunner: Identifiable {
     private(set) var status: Status = .disabled
     private(set) var log: [LogLine] = []
     var runs: [RunRecord] = [] {
-        didSet { history?.saveRuns(runs) }
+        didSet {
+            history?.saveRuns(runs)
+            checkProvisioning()
+        }
     }
+    /// Chosen devices the newest build of their platform isn't provisioned for, by id, so the
+    /// device list can warn before a deploy fails.
+    private(set) var unprovisionedDevices: Set<String> = []
+    /// What `unprovisionedDevices` was worked out from, so profiles are read again only when a
+    /// build or the chosen devices change, not on every update of a run.
+    @ObservationIgnored private var provisioningInputs: [String]?
     private(set) var lastCheck: Date?
     private(set) var nextCheck: Date?
     private(set) var lastError: String?
@@ -102,10 +112,21 @@ final class PipelineRunner: Identifiable {
         runs = history?.loadRuns() ?? []
         log = history?.loadLog() ?? []
         self.history = history
+        checkProvisioning()
         if config.isEnabled { start() }
     }
 
     var lastRun: RunRecord? { runs.first }
+
+    private func checkProvisioning() {
+        let inputs = config.devices.map { "\($0.id) \($0.udid ?? "")" } + runs.flatMap { run in
+            (run.products ?? [:]).map { "\(run.id) \($0.key) \($0.value.appURL.path)" }.sorted()
+        }
+        guard inputs != provisioningInputs else { return }
+        provisioningInputs = inputs
+        let ids = Provisioning.unprovisioned(config.devices, runs: runs)
+        if ids != unprovisionedDevices { unprovisionedDevices = ids }
+    }
 
     /// The builder's builds for this pipeline's devices, newest first; of any platform while
     /// no device is chosen.

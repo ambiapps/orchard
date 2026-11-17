@@ -152,6 +152,8 @@ struct ContentViewLayoutTests {
             try harness.snapshot(to: directory.appendingPathComponent("deploys-expanded-\(name).png"))
 
             try redeploySnapshot(appearance: appearance, to: directory.appendingPathComponent("redeploy-\(name).png"))
+            try unprovisionedSnapshot(appearance: appearance,
+                                      to: directory.appendingPathComponent("unprovisioned-\(name).png"))
         }
     }
 
@@ -230,6 +232,35 @@ struct ContentViewLayoutTests {
         var runs = sampleRuns(device: phone.id)
         runs[0].outcome = .failed("1 of 2 device(s) failed")
         runs[0].deviceOutcomes = [phone.id: .failed("The device is not connected."), pad.id: .succeeded]
+        runs[0].products = [BuildPlatform.iOS.rawValue: BuiltProduct(
+            appURL: dir.url.appendingPathComponent("App.app"), bundleIdentifier: "com.example.app")]
+        runner.runs = runs
+        let harness = makeWindow(width: 1100, appearance: appearance, store: store)
+        defer { harness.close() }
+        harness.window.title = runner.config.name
+        try harness.snapshot(to: url)
+    }
+
+    /// Two chosen iPhones, one of which the latest build's provisioning profile doesn't list.
+    private func unprovisionedSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+        let dir = try TemporaryDirectory()
+        try dir.makeDirectories("App.app")
+        let plist = try PropertyListSerialization.data(
+            fromPropertyList: ["Name": "iOS Team Provisioning Profile: com.example.app",
+                               "ProvisionedDevices": ["00008140-0000000000000001"]],
+            format: .xml, options: 0)
+        try plist.write(to: dir.url.appendingPathComponent("App.app/embedded.mobileprovision"))
+        let phone = Device(id: "iphone", name: "César's iPhone", model: "iPhone 17 Pro", kind: .physical,
+                           platform: .iOS, osVersion: "26.0", udid: "00008140-0000000000000001")
+        let newPhone = Device(id: "new", name: "Kim's iPhone", model: "iPhone 16 Pro Max", kind: .physical,
+                              platform: .iOS, osVersion: "26.0", udid: "00008140-0000000000000002")
+        let store = AppStore(defaults: nil, discoversDevices: false, devices: [
+            DiscoveredDevice(device: phone, isConnected: true),
+            DiscoveredDevice(device: newPhone, isConnected: true),
+        ])
+        let runner = store.addPipeline()
+        runner.config.devices = [phone, newPhone]
+        var runs = sampleRuns(device: phone.id)
         runs[0].products = [BuildPlatform.iOS.rawValue: BuiltProduct(
             appURL: dir.url.appendingPathComponent("App.app"), bundleIdentifier: "com.example.app")]
         runner.runs = runs
