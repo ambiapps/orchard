@@ -99,9 +99,11 @@ enum DeviceDiscovery {
             case "pairingInProgress": pairing = .inProgress
             default: return nil
             }
-            // Only simulators are ruled out. A device may not say it's physical: one that isn't paired
-            // yet, and on a Mac without Xcode a paired one until its tunnel is up.
-            guard hardware?.reality != "simulated" else { return nil }
+            // Only simulators are ruled out. A real device may not say it's physical: one that isn't
+            // paired yet, and often a paired one too (seen with and without Xcode). Simulators say
+            // so, and are also the only entries on this same Mac.
+            let transport = connection?.transportType ?? entry.connectionProperties?.transportType
+            guard hardware?.reality != "simulated", transport != "sameMachine" else { return nil }
             let platform = hardware?.platform.flatMap { BuildPlatform(devicePlatform: $0, simulator: false) }
             guard let platform = platform ?? (pairing == .paired ? nil : .iOS) else { return nil }
 
@@ -117,7 +119,6 @@ enum DeviceDiscovery {
                 udid: hardware?.udid
             )
             let state = connection?.state ?? entry.connectionProperties?.tunnelState
-            let transport = connection?.transportType ?? entry.connectionProperties?.transportType
             return PhysicalDevice(
                 device: device, pairing: pairing,
                 isWired: transport == "wired",

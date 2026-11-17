@@ -184,6 +184,9 @@ struct DeviceDiscoveryTests {
 
     @Test func skipsSimulatorsAndDevicesThatCannotPair() {
         #expect(parsed("SIM") == nil)
+        // A simulator that doesn't say it's simulated is still on this same Mac.
+        let json = #"{"result": {"devices": [{"identifier": "QUIETSIM", "properties": {"connection": {"pairingState": "paired", "state": "disconnected", "transportType": "sameMachine"}, "hardware": {"platform": "iOS"}}}]}}"#
+        #expect(DeviceDiscovery.physicalDevices(fromJSON: Data(json.utf8)) == [])
         #expect(parsed("UNSUPPORTED") == nil)
     }
 

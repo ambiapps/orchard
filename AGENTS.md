@@ -77,7 +77,7 @@ Opt-in (`AppStore.setsUpDevicesAutomatically`, UserDefaults key `setsUpDevicesAu
 4. When `prepare` succeeds the device is appended to every pipeline with `addsNewDevices` (`deploysToNewDevices ?? true`), and enabled pipelines run `PipelineRunner.deploy(toNew:)`: a run for just that device, built with `-destination id=<udid>`, because xcodebuild registers only its destination device with the team and a generic destination has none.
 5. State shows on the device row (`DiscoveredDevice.onboarding`) and every change goes to `~/Library/Logs/Orchard/devices.log` (`DeviceLog`). Never add a state that needs someone at the Mac.
 
-`devicectl`'s JSON is read from its `properties` dictionary, falling back to the deprecated `connectionProperties`/`deviceProperties`/`hardwareProperties`. `connection.state` is `connected`, `disconnected` (reachable, tunnel down; devicectl connects on demand) or `unavailable`; `transportType` is `wired` or `localNetwork`. Don't require `hardware.reality == "physical"`, only rule out `simulated`: the standalone devicectl on a Mac without Xcode leaves out `reality` and `marketingName` for a paired device whose tunnel is down.
+`devicectl`'s JSON is read from its `properties` dictionary, falling back to the deprecated `connectionProperties`/`deviceProperties`/`hardwareProperties`. `connection.state` is `connected`, `disconnected` (reachable, tunnel down; devicectl connects on demand) or `unavailable`; `transportType` is `wired` or `localNetwork`. Don't require `hardware.reality == "physical"`, only rule out `simulated`: devicectl often leaves out `reality` (and `marketingName`) for real paired devices, with or without Xcode. Simulators are also told apart by `transportType` `sameMachine`.
 
 ## Builder and clients
 
