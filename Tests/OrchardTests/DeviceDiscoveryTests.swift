@@ -184,6 +184,9 @@ struct DeviceDiscoveryTests {
 
     @Test func skipsSimulatorsAndDevicesThatCannotPair() {
         #expect(parsed("SIM") == nil)
+        // A simulator that doesn't say it's simulated is still on this same Mac.
+        let json = #"{"result": {"devices": [{"identifier": "QUIETSIM", "properties": {"connection": {"pairingState": "paired", "state": "disconnected", "transportType": "sameMachine"}, "hardware": {"platform": "iOS"}}}]}}"#
+        #expect(DeviceDiscovery.physicalDevices(fromJSON: Data(json.utf8)) == [])
         #expect(parsed("UNSUPPORTED") == nil)
     }
 
@@ -195,6 +198,33 @@ struct DeviceDiscoveryTests {
         let rows = DeviceDiscovery.devices(physical: physical, simulators: [], onboarding: ["NEW": .waitingForTrust])
         #expect(Set(rows.map(\.id)) == Set(paired + ["NEW"]))
         #expect(rows.first { $0.id == "NEW" }?.onboarding == .waitingForTrust)
+    }
+
+    /// What the standalone devicectl (no Xcode, device support installed from a builder) reported
+    /// for a phone paired with that Mac, with its name and identifiers changed: no `reality` and no
+    /// `marketingName`, until the tunnel is up.
+    @Test func listsAPairedDeviceThatDoesNotSayItIsPhysical() throws {
+        let json = #"""
+        {"info": {"jsonVersion": 5, "outcome": "success", "version": "651.32"}, "result": {"devices": [
+          {"identifier": "STANDALONE",
+           "connectionProperties": {"authenticationType": "manualPairing", "pairingState": "paired", "transportType": "wired", "tunnelState": "disconnected"},
+           "deviceProperties": {"bootState": "booted", "ddiServicesAvailable": false, "name": "Kim’s iPhone", "osVersionNumber": "27.3"},
+           "hardwareProperties": {"deviceType": "iPhone", "platform": "iOS", "productType": "iPhone17,2", "udid": "00008140-0000000000000000"},
+           "properties": {
+             "connection": {"authenticationType": "manualPairing", "pairingState": "paired", "state": "disconnected", "transportType": "wired", "tunnelTransportProtocol": "tcp"},
+             "hardware": {"deviceType": "iPhone", "platform": "iOS", "productType": "iPhone17,2", "udid": "00008140-0000000000000000"},
+             "software": {"osVersionNumber": {"components": [27, 3, 0, 0, 0], "stringValue": "27.3"}},
+             "state": {"bootState": "booted", "name": "Kim’s iPhone"}}}
+        ]}}
+        """#
+        let physical = try #require(DeviceDiscovery.physicalDevices(fromJSON: Data(json.utf8)))
+        let device = try #require(physical.first)
+        #expect(device.device == Device(id: "STANDALONE", name: "Kim’s iPhone", model: "iPhone", kind: .physical,
+                                        platform: .iOS, osVersion: "27.3", udid: "00008140-0000000000000000"))
+        #expect(device.pairing == .paired)
+        #expect(device.isWired)
+        #expect(device.isReachable)
+        #expect(DeviceDiscovery.devices(physical: physical, simulators: []).map(\.id) == [Device.thisMac.id, "STANDALONE"])
     }
 
     /// Not an empty list: a listing that failed mustn't look like every device was unplugged.
