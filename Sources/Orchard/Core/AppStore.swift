@@ -291,7 +291,7 @@ final class AppStore {
     /// being created; pipelines this Mac itself gets from a builder aren't passed on.
     private func listSharedPipelines() {
         guard discoversDevices, sharesBuilds else { return }
-        let list = pipelines.filter { !$0.config.isRemote && $0.config.missingSetup == nil }
+        let list = pipelines.filter { !$0.config.isRemote && $0.missingSetup == nil }
             .map { SharedBuilds.Listed(id: $0.id, name: $0.config.name) }
         guard list != listedPipelines else { return }
         listedPipelines = list

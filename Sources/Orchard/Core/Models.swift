@@ -173,13 +173,15 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
         Set(devices.map(\.platform)).union(alsoBuilds.map { [$0] } ?? [])
     }
 
-    var missingSetup: String? {
-        if !isRemote {
-            if repoPath == nil { return "Choose a repository" }
-            if branch == nil { return "Choose a branch" }
-            if scheme == nil { return "Choose a scheme" }
-        }
-        if buildPlatforms.isEmpty || (isRemote && devices.isEmpty) { return "Choose at least one device" }
+    /// What's left to set up before the pipeline can run; nil when it can. On a builder
+    /// (`sharesBuilds`) a pipeline needs no devices: with none, it builds every platform its
+    /// scheme supports, for its clients.
+    func missingSetup(sharesBuilds: Bool) -> String? {
+        if isRemote { return devices.isEmpty ? "Choose at least one device" : nil }
+        if repoPath == nil { return "Choose a repository" }
+        if branch == nil { return "Choose a branch" }
+        if scheme == nil { return "Choose a scheme" }
+        if devices.isEmpty, !sharesBuilds { return "Choose at least one device" }
         return nil
     }
 }

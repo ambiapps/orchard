@@ -93,7 +93,7 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var newDevices: [Device] = []
     @ObservationIgnored private let deployer: DeployAction
     /// Whether this Mac is a builder: each build is then also zipped for its clients. Set by `AppStore`.
-    @ObservationIgnored var sharesBuilds = false
+    var sharesBuilds = false
     /// The builder a remote pipeline (`config.remoteID`) gets its builds from. Set by `AppStore`.
     @ObservationIgnored var builder: BuilderClient?
     @ObservationIgnored private let sharedRoot: URL
@@ -288,6 +288,9 @@ final class PipelineRunner: Identifiable {
         }
     }
 
+    /// What's left to set up before the pipeline can run; nil when it can.
+    var missingSetup: String? { config.missingSetup(sharesBuilds: sharesBuilds) }
+
     func cancelRun() {
         runTask?.cancel()
     }
@@ -303,17 +306,12 @@ final class PipelineRunner: Identifiable {
         guard runTask == nil else { return }
         // A rebuild asked for while this check was going runs once it's done, whatever it found.
         defer { resumeQueuedRebuild() }
-        if let missing = config.missingSetup {
+        if let missing = missingSetup {
             lastError = missing
             return
         }
         if let remoteID = config.remoteID {
             await checkRemote(remoteID, force: force, newDevice: newDevice)
-            return
-        }
-        // "Also build for" only counts on a builder; without sharing there'd be nothing to do.
-        if config.devices.isEmpty, !sharesBuilds {
-            lastError = "Choose at least one device"
             return
         }
         guard let repo = config.repoURL, let branch = config.branch else { return }
@@ -393,9 +391,36 @@ final class PipelineRunner: Identifiable {
             update { $0.timings = timings }
 
             let groups = Dictionary(grouping: config.devices, by: \.platform)
-            // A builder also builds a platform none of its own devices needs, for its clients.
-            let platforms = sharesBuilds ? config.buildPlatforms : Set(groups.keys)
-            if sharesBuilds { SharedBuilds.remove(pipeline: config.id, keeping: platforms, root: sharedRoot) }
+            // A builder also builds for its clients: the platform chosen in "Also build for", or
+            // else every platform the scheme supports, since it can't know which devices they have.
+            var platforms = sharesBuilds ? config.buildPlatforms : Set(groups.keys)
+            // A run that only brings a new device the commit the others already run builds just its platform.
+            let onlyNewDevice = newDevice != nil && commit == self.config.lastDeployedCommit
+            var knowsPlatforms = true
+            if sharesBuilds, config.alsoBuilds == nil, !onlyNewDevice {
+                append(.step, "Looking up the platforms \(scheme) supports")
+                do {
+                    platforms.formUnion(try await Xcode.supportedPlatforms(
+                        container: config.containerPath, scheme: scheme, in: dirs.checkout))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch where !platforms.isEmpty {
+                    // This Mac's own devices still get their build.
+                    knowsPlatforms = false
+                    append(.warning, "Couldn't look up the platforms \(scheme) supports: \(error.localizedDescription)")
+                }
+                append(.info, "Building for "
+                    + BuildPlatform.allCases.filter(platforms.contains).map(\.displayName).joined(separator: ", "))
+            }
+            // Platforms a run no longer builds stop being shared, but not because of a run for
+            // just a new device, or because the lookup failed.
+            // Platforms only the lookup added: one of them failing to build (its SDK isn't
+            // installed, say) is a warning, as long as something else was built.
+            let lookedUp = platforms.subtracting(config.buildPlatforms)
+            var lookedUpFailures: [BuildPlatform] = []
+            if sharesBuilds, !onlyNewDevice, knowsPlatforms {
+                SharedBuilds.remove(pipeline: config.id, keeping: platforms, root: sharedRoot)
+            }
             for platform in BuildPlatform.allCases where platforms.contains(platform) {
                 var devices = groups[platform] ?? []
                 try Task.checkCancellation()
@@ -421,7 +446,9 @@ final class PipelineRunner: Identifiable {
                     } catch {
                         let elapsed = Date().timeIntervalSince(buildStart).formattedDuration
                         append(.error, "Build for \(platform.displayName) failed after \(elapsed)")
-                        if failingDevices {
+                        if failingDevices, lookedUp.contains(platform) {
+                            lookedUpFailures.append(platform)
+                        } else if failingDevices {
                             buildFailed = true
                             for device in devices {
                                 update { $0.deviceOutcomes[device.id] = .failed("Build failed") }
@@ -475,7 +502,11 @@ final class PipelineRunner: Identifiable {
                     } catch {
                         append(.warning, "Couldn't share the \(platform.displayName) build: \(error.localizedDescription)")
                         // With no device of its own, sharing was all this build was for.
-                        if devices.isEmpty { buildFailed = true }
+                        if lookedUp.contains(platform) {
+                            lookedUpFailures.append(platform)
+                        } else if devices.isEmpty {
+                            buildFailed = true
+                        }
                     }
                 }
                 guard !devices.isEmpty else { continue }
@@ -489,7 +520,10 @@ final class PipelineRunner: Identifiable {
                 try await deployAll(product, to: devices, run: record.id, log: raw)
             }
 
+            if !lookedUpFailures.isEmpty, Set(lookedUpFailures) == platforms { buildFailed = true }
+            let skipped = BuildPlatform.allCases.filter(lookedUpFailures.contains).map(\.displayName)
             conclude(record.id, commit: commit, config: config, buildFailed: buildFailed,
+                     warning: skipped.isEmpty ? nil : "Couldn't build for \(skipped.joined(separator: ", "))",
                      took: timings.summary(total: Date().timeIntervalSince(runStart)))
         } catch is CancellationError {
             update {
@@ -508,10 +542,12 @@ final class PipelineRunner: Identifiable {
 
     /// Sets a finished run's outcome from its devices', logs it and notifies.
     private func conclude(_ id: RunRecord.ID, commit: String, config: PipelineConfig,
-                          buildFailed: Bool = false, took: String) {
+                          buildFailed: Bool = false, warning: String? = nil, took: String) {
         var outcome = runs.first(where: { $0.id == id })?.finalOutcome(devices: config.devices) ?? .succeeded
         // With no device of its own (a builder that only shares), a failed build fails nothing else.
         if buildFailed, outcome == .succeeded { outcome = .failed("Build failed") }
+        // A platform only clients might use didn't build, but everything else did.
+        if let warning, outcome == .succeeded { outcome = .warning(warning) }
         if let index = runs.firstIndex(where: { $0.id == id }) { runs[index].outcome = outcome }
         switch outcome {
         case .failed(let summary):
@@ -522,7 +558,8 @@ final class PipelineRunner: Identifiable {
             self.config.lastDeployedCommit = commit
             self.config.lastDeployedAt = Date()
             append(.warning, "\(summary) after \(took)")
-            Notifier.post(title: "Installed \(config.name)", body: "\(commit.shortSHA): \(summary)")
+            Notifier.post(title: config.devices.isEmpty ? "Built \(config.name)" : "Installed \(config.name)",
+                          body: "\(commit.shortSHA): \(summary)")
         default:
             self.config.lastDeployedCommit = commit
             self.config.lastDeployedAt = Date()

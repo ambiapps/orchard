@@ -111,6 +111,33 @@ enum Xcode {
         return BuiltProduct(appURL: url, bundleIdentifier: bundleID)
     }
 
+    /// The device platforms (not simulators) `scheme`'s app supports, from `SUPPORTED_PLATFORMS`.
+    /// A builder with no devices of its own builds all of them for its clients. This reloads the
+    /// workspace (`-showBuildSettings`), so it's only asked when there's no device to go by.
+    static func supportedPlatforms(container: String?, scheme: String, in checkout: URL) async throws -> Set<BuildPlatform> {
+        let output = try await Shell.run(
+            "/usr/bin/xcodebuild", containerArguments(container) + ["-scheme", scheme, "-showBuildSettings", "-json"],
+            in: checkout)
+        guard let data = jsonPayload(in: output, opening: "[") else { throw XcodeError.noBuildSettings }
+        let platforms = try supportedPlatforms(inBuildSettings: data, scheme: scheme)
+        guard !platforms.isEmpty else { throw XcodeError.noSupportedPlatforms(scheme: scheme) }
+        return platforms
+    }
+
+    /// The device platforms of the scheme's app target in `-showBuildSettings -json` output: the
+    /// target named like the scheme, else the first app. Other apps (an embedded watch app) are
+    /// built as part of it, not on their own. Mac Catalyst doesn't count as macOS.
+    static func supportedPlatforms(inBuildSettings data: Data, scheme: String) throws -> Set<BuildPlatform> {
+        let targets = try JSONDecoder().decode([TargetSettings].self, from: data)
+        let apps = targets.filter { $0.buildSettings["WRAPPER_EXTENSION"] == "app" }
+        guard let app = apps.first(where: { $0.target == scheme }) ?? apps.first else { return [] }
+        var names = Set((app.buildSettings["SUPPORTED_PLATFORMS"] ?? "").split(separator: " ").map(String.init))
+        // An iOS app that also runs as Mac Catalyst lists `macosx` too, but building it for
+        // `platform=macOS` makes a Catalyst app nobody asked for, in a folder `builtApp` doesn't look in.
+        if app.buildSettings["SUPPORTS_MACCATALYST"] == "YES" { names.remove("macosx") }
+        return Set(BuildPlatform.allCases.filter { !$0.isSimulator && names.contains($0.platformName) })
+    }
+
     /// Where xcodebuild puts products by default for `-derivedDataPath`.
     static func productsDirectory(derivedData: URL, configuration: String, platform: BuildPlatform) -> URL {
         let name = platform == .macOS ? configuration : "\(configuration)-\(platform.platformName)"
@@ -169,6 +196,7 @@ enum XcodeError: LocalizedError {
     case noBuildSettings
     case noAppProduct(scheme: String, platform: BuildPlatform)
     case productMissing(URL)
+    case noSupportedPlatforms(scheme: String)
 
     var errorDescription: String? {
         switch self {
@@ -178,6 +206,8 @@ enum XcodeError: LocalizedError {
             "Scheme “\(scheme)” doesn't produce a \(platform.displayName) app."
         case .productMissing(let url):
             "Build succeeded but \(url.path) is missing."
+        case .noSupportedPlatforms(let scheme):
+            "Scheme “\(scheme)” doesn't build an app for any device platform."
         }
     }
 }

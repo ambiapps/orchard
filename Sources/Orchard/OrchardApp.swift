@@ -75,7 +75,7 @@ private struct MenuBarContent: View {
                 Text(runner.config.name)
                 Text(runner.status.label)
             }
-            .disabled(runner.config.missingSetup != nil)
+            .disabled(runner.missingSetup != nil)
         }
         Divider()
         if let release = updater.available {
