@@ -69,6 +69,12 @@ final class PipelineRunner: Identifiable {
     /// What `unprovisionedDevices` was worked out from, so profiles are read again only when a
     /// build or the chosen devices change, not on every update of a run.
     @ObservationIgnored private var provisioningInputs: [String]?
+    /// Client: chosen devices this Mac asked the builder to register, by id, until the warning
+    /// goes away.
+    private(set) var registrationRequests: [String: RegistrationState] = [:]
+    enum RegistrationState: Equatable { case requesting, requested }
+    /// Builder: a client's device was registered while a run was going; build again after it.
+    @ObservationIgnored private var rebuildQueued = false
     private(set) var lastCheck: Date?
     private(set) var nextCheck: Date?
     private(set) var lastError: String?
@@ -136,6 +142,8 @@ final class PipelineRunner: Identifiable {
         provisioningInputs = inputs
         let ids = Provisioning.unprovisioned(config.devices, apps: checkedApps.mapValues(\.app))
         if ids != unprovisionedDevices { unprovisionedDevices = ids }
+        let requests = registrationRequests.filter { ids.contains($0.key) || $0.value == .requesting }
+        if requests != registrationRequests { registrationRequests = requests }
     }
 
     /// The builder's builds for this pipeline's devices, newest first; of any platform while
@@ -195,6 +203,54 @@ final class PipelineRunner: Identifiable {
     func buildNow() {
         guard runTask == nil else { return }
         Task { await check(force: true) }
+    }
+
+    /// Builder: builds the branch head again, after the run that's going if there is one, so a
+    /// device that was just registered gets into the profile.
+    func rebuild() {
+        rebuildQueued = true
+        guard runTask == nil else { return }
+        Task { await rebuildIfQueued() }
+    }
+
+    private func rebuildIfQueued() async {
+        while rebuildQueued, runTask == nil, !status.isBusy {
+            rebuildQueued = false
+            await check(force: true)
+        }
+    }
+
+    /// Client: asks the builder to register `device` with its team and build again. The new
+    /// build comes like any other.
+    func requestRegistration(of device: Device) async -> DeviceRegistrationResult {
+        guard let builder, let remoteID = config.remoteID else {
+            return DeviceRegistrationResult(status: .failed, message: BuilderError.notConnected.errorDescription)
+        }
+        guard let udid = device.udid else {
+            return DeviceRegistrationResult(
+                status: .failed, message: "Orchard doesn't know this device's UDID yet. Connect it to this Mac and try again.")
+        }
+        guard registrationRequests[device.id] == nil else { return DeviceRegistrationResult(status: .registered) }
+        registrationRequests[device.id] = .requesting
+        let result: DeviceRegistrationResult
+        do {
+            result = try await builder.registerDevice(DeviceRegistrationRequest(
+                pipeline: remoteID, name: device.name, udid: udid, platform: device.platform))
+        } catch {
+            result = DeviceRegistrationResult(status: .failed, message: error.localizedDescription)
+        }
+        let builderName = config.builderLabel ?? "The builder"
+        switch result.status {
+        case .registered, .alreadyRegistered:
+            registrationRequests[device.id] = .requested
+            append(.info, "\(builderName) registered \(device.name) with its team"
+                   + (result.rebuilding == true ? " and is building again" : ""))
+        case .unavailable, .failed:
+            registrationRequests[device.id] = nil
+            append(.warning, "\(builderName) couldn't register \(device.name): "
+                   + (result.message ?? "it has no App Store Connect key"))
+        }
+        return result
     }
 
     /// Deploys the branch head to a device that automatic setup just added, without waiting for
@@ -272,6 +328,7 @@ final class PipelineRunner: Identifiable {
             runTask = task
             await task.value
             runTask = nil
+            if rebuildQueued { Task { await rebuildIfQueued() } }
         } catch is CancellationError {
         } catch {
             lastCheck = Date()

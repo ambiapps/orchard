@@ -1,3 +1,4 @@
+import CryptoKit
 import AppKit
 import Foundation
 import SwiftUI
@@ -95,9 +96,17 @@ struct ContentViewLayoutTests {
                 try settings.snapshot(to: directory.appendingPathComponent("settings-\(isOn ? "on" : "off")-\(name).png"))
             }
 
-            for state in ["builder", "client", "client-pairing"] {
-                let store = makeTestStore()
-                if state == "builder" {
+            for state in ["builder", "builder-key", "client", "client-pairing"] {
+                // A builder with an App Store Connect key loads it from its key store.
+                let keys = try TemporaryDirectory()
+                let keyStore = AppStoreConnectKeyStore(directory: keys.url)
+                if state == "builder-key" {
+                    try keyStore.save(AppStoreConnectKey(issuerID: "issuer", keyID: "2X9R4HXF34",
+                                                         privateKey: P256.Signing.PrivateKey().pemRepresentation))
+                }
+                let store = AppStore(defaults: nil, discoversDevices: false, keyStore: keyStore)
+                store.addPipeline()
+                if state.hasPrefix("builder") {
                     store.sharesBuilds = true
                     _ = store.clientAccess.check(token: "a", name: "Ada's MacBook Air")
                     store.accessChanged(newRequest: nil)
@@ -154,6 +163,8 @@ struct ContentViewLayoutTests {
             try redeploySnapshot(appearance: appearance, to: directory.appendingPathComponent("redeploy-\(name).png"))
             try unprovisionedSnapshot(appearance: appearance,
                                       to: directory.appendingPathComponent("unprovisioned-\(name).png"))
+            try unprovisionedSnapshot(appearance: appearance, client: true,
+                                      to: directory.appendingPathComponent("unprovisioned-client-\(name).png"))
         }
     }
 
@@ -241,8 +252,9 @@ struct ContentViewLayoutTests {
         try harness.snapshot(to: url)
     }
 
-    /// Two chosen iPhones, one of which the latest build's provisioning profile doesn't list.
-    private func unprovisionedSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+    /// Two chosen iPhones, one of which the latest build's provisioning profile doesn't list. On a
+    /// client's pipeline, the row offers to ask the builder to register it.
+    private func unprovisionedSnapshot(appearance: NSAppearance.Name, client: Bool = false, to url: URL) throws {
         let dir = try TemporaryDirectory()
         try dir.makeDirectories("App.app")
         let plist = try PropertyListSerialization.data(
@@ -259,6 +271,11 @@ struct ContentViewLayoutTests {
             DiscoveredDevice(device: newPhone, isConnected: true),
         ])
         let runner = store.addPipeline()
+        if client {
+            runner.config.remoteID = UUID()
+            runner.config.name = "Flightradar24"
+            runner.config.builderName = "Office Mac"
+        }
         runner.config.devices = [phone, newPhone]
         var runs = sampleRuns(device: phone.id)
         runs[0].products = [BuildPlatform.iOS.rawValue: BuiltProduct(

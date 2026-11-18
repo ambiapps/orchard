@@ -58,7 +58,7 @@ A client needs no Xcode. `devicectl` comes from a 150 MB Apple-signed package in
 
 Things to know:
 
-- A phone has to be in the app's provisioning profile, so register it with your team first: plug it into the builder once with automatic setup on (then untick it there, or the builder keeps trying to reach it), or add its UDID in the developer portal. A client says so when a device isn't in the profile, and the device list warns about a chosen device the latest build's profile doesn't list.
+- A phone has to be in the app's provisioning profile, so register it with your team first: plug it into the builder once with automatic setup on (then untick it there, or the builder keeps trying to reach it), or add its UDID in the developer portal. A client says so when a device isn't in the profile, and the device list warns about a chosen device the latest build's profile doesn't list. If the builder has an App Store Connect API key (Admin role, added in its Settings), **Request to Be Added** next to that warning has the builder register the device and build again; without a key, the client says so and shows the UDID to register by hand.
 - Development builds need Developer Mode on the phone.
 - Only Macs approved on the builder can download builds; each has its own token. Traffic is plain HTTP, though, so use it on a network you trust or over a VPN. Links from Orchard 1.0.15 and earlier still work, but each client has to be approved once.
 - The builder keeps one build per pipeline and platform, the latest.

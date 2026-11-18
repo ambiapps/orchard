@@ -48,6 +48,9 @@ final class AppStore {
     var sharingLink: String {
         BuilderLink.string(host: ProcessInfo.processInfo.hostName, port: BuilderLink.defaultPort)
     }
+    /// Builder: the App Store Connect API key with which it registers its clients' devices with
+    /// the team. Without one, a client's request gets "this builder can't register devices".
+    private(set) var appStoreConnectKey: AppStoreConnectKey?
     /// Macs that may download this Mac's builds, and those waiting for the user to enter their code.
     private(set) var approvedClients: [ApprovedClient] = []
     private(set) var pairingRequests: [PairingRequest] = []
@@ -173,6 +176,8 @@ final class AppStore {
     @ObservationIgnored private var activity: NSObjectProtocol?
     @ObservationIgnored private let discoversDevices: Bool
     @ObservationIgnored private let commands: DeviceOnboarding.Commands
+    @ObservationIgnored private let registrar: DeviceRegistrar
+    @ObservationIgnored private let keyStore: AppStoreConnectKeyStore?
     @ObservationIgnored private let deviceLog: DeviceLog?
     @ObservationIgnored private var physical: [PhysicalDevice] = []
     @ObservationIgnored private var simulators: [DiscoveredDevice] = []
@@ -187,10 +192,16 @@ final class AppStore {
     /// the user's pipelines, and `discoversDevices: false` so they don't depend on the host's devices
     /// (optionally staging `devices` instead).
     /// `commands` are the devicectl calls automatic setup makes, and `deviceLog` where it logs
-    /// (by default `devices.log`, or nowhere for an in-memory store).
+    /// (by default `devices.log`, or nowhere for an in-memory store). `registrar` registers
+    /// clients' devices, and `keyStore` keeps the App Store Connect key (an in-memory store keeps
+    /// it nowhere).
     init(defaults: UserDefaults? = .standard, discoversDevices: Bool = true, devices: [DiscoveredDevice] = [],
-         commands: DeviceOnboarding.Commands = .devicectl, deviceLog: DeviceLog? = nil) {
+         commands: DeviceOnboarding.Commands = .devicectl, deviceLog: DeviceLog? = nil,
+         registrar: DeviceRegistrar = .appStoreConnect, keyStore: AppStoreConnectKeyStore? = nil) {
         self.defaults = defaults
+        self.registrar = registrar
+        self.keyStore = keyStore ?? (defaults == nil ? nil : AppStoreConnectKeyStore())
+        appStoreConnectKey = self.keyStore?.load()
         self.devices = devices
         self.discoversDevices = discoversDevices
         self.commands = commands
@@ -249,8 +260,11 @@ final class AppStore {
                 clientAccess.prune()
             }
         }
-        let service = BuildService(name: Self.computerName, access: clientAccess,
+        var service = BuildService(name: Self.computerName, access: clientAccess,
                                    deviceSupport: DeviceSupport.package())
+        service.registerDevice = { [weak self] request, client in
+            await self?.registerDevice(request, from: client) ?? .unavailable
+        }
         serverTask = Task { [weak self] in
             // The port of a server that was just stopped takes a moment to come free, so a
             // quick off-and-on tries a few times before giving up.
@@ -438,6 +452,43 @@ final class AppStore {
             log("\(newRequest.name) asks to download builds")
             Notifier.post(title: "\(newRequest.name) wants this Mac's builds",
                           body: "To let it in, enter the code it shows in Orchard's Settings.")
+        }
+    }
+
+    /// Checks the key with App Store Connect and keeps it.
+    func setAppStoreConnectKey(_ key: AppStoreConnectKey) async throws {
+        try key.validate()
+        try await registrar.verify(key)
+        try keyStore?.save(key)
+        appStoreConnectKey = key
+        log("Added App Store Connect key \(key.keyID); clients can ask to register devices")
+    }
+
+    func removeAppStoreConnectKey() {
+        keyStore?.remove()
+        appStoreConnectKey = nil
+        log("Removed the App Store Connect key")
+    }
+
+    /// Builder: registers a client's device with the team, deletes Xcode's cached profiles and
+    /// builds the pipeline again, so its next build has a profile with the device.
+    func registerDevice(_ request: DeviceRegistrationRequest, from client: String) async -> DeviceRegistrationResult {
+        guard let key = appStoreConnectKey else { return .unavailable }
+        guard sharesBuilds, let runner = pipelines.first(where: { $0.id == request.pipeline && !$0.config.isRemote })
+        else { return DeviceRegistrationResult(status: .failed, message: "The builder doesn't have that pipeline.") }
+        do {
+            let registration = try await registrar.register(key, request)
+            registrar.removeProfiles()
+            runner.rebuild()
+            let done = registration == .alreadyRegistered ? "was already registered" : "is now registered"
+            log("\(client) asked to add \(request.name) (\(request.udid)); it \(done), building \(runner.config.name) again")
+            Notifier.post(title: "Registered \(request.name)",
+                          body: "\(client) asked for it. Building \(runner.config.name) again with a new profile.")
+            return DeviceRegistrationResult(status: registration == .alreadyRegistered ? .alreadyRegistered : .registered,
+                                            rebuilding: true)
+        } catch {
+            log("Couldn't register \(request.name) for \(client): \(error.localizedDescription)")
+            return DeviceRegistrationResult(status: .failed, message: error.localizedDescription)
         }
     }
 

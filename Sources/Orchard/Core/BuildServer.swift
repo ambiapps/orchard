@@ -9,6 +9,12 @@ struct HTTPRequest: Equatable, Sendable {
     var headers: [String: String] = [:]
     /// The client's IP address, set by the server.
     var remoteAddress: String?
+    var body = Data()
+
+    /// The largest body the server reads; only a `DeviceRegistrationRequest` has one.
+    static let maxBodyLength = 16_384
+
+    var contentLength: Int { headers["content-length"].flatMap { Int($0) } ?? 0 }
 
     /// Parses a request head (the lines before the blank one); nil if it isn't one.
     static func parse(_ head: Data) -> HTTPRequest? {
@@ -48,6 +54,7 @@ struct HTTPResponse: Equatable, Sendable {
         case 403: "Forbidden"
         case 404: "Not Found"
         case 405: "Method Not Allowed"
+        case 413: "Content Too Large"
         default: "Error"
         }
     }
@@ -61,13 +68,34 @@ struct BuildService: Sendable {
     var root: URL = Paths.pipelines
     /// The package with `devicectl` from this Mac's Xcode, for clients that have no Xcode.
     var deviceSupport: URL?
+    /// Registers a client's device with the team; nil answers that this builder can't. Gets the
+    /// client's name too.
+    var registerDevice: (@Sendable (DeviceRegistrationRequest, String) async -> DeviceRegistrationResult)?
 
+    /// Every request, including `POST /v1/devices`, which waits for App Store Connect.
+    func respond(to request: HTTPRequest) async -> HTTPResponse {
+        if let refusal = refusal(of: request) { return refusal }
+        guard request.method == "POST", request.path == "/v1/devices" else { return route(request) }
+        guard let registration = try? JSONDecoder().decode(DeviceRegistrationRequest.self, from: request.body)
+        else { return .text(400, "Bad request") }
+        let client = request.headers[ClientHeader.name.lowercased()]?.removingPercentEncoding ?? "A client"
+        let result = await registerDevice?(registration, client) ?? .unavailable
+        guard let data = try? JSONEncoder().encode(result) else { return .text(500, "Error") }
+        return HTTPResponse(status: 200, contentType: "application/json", body: .data(data))
+    }
+
+    /// A GET request.
     func response(to request: HTTPRequest) -> HTTPResponse {
+        refusal(of: request) ?? route(request)
+    }
+
+    /// Nil when the request comes from an approved client.
+    private func refusal(of request: HTTPRequest) -> HTTPResponse? {
         let authorization = request.headers["authorization"] ?? ""
         let token = authorization.hasPrefix("Bearer ") ? String(authorization.dropFirst(7)) : nil
         switch access.check(token: token, name: request.headers[ClientHeader.name.lowercased()]?.removingPercentEncoding,
                             address: request.remoteAddress) {
-        case .allowed: break
+        case .allowed: return nil
         case .pending: return .text(403, "Waiting for approval")
         case .declined:
             var response = HTTPResponse.text(401, "Declined")
@@ -75,6 +103,9 @@ struct BuildService: Sendable {
             return response
         case .refused: return .text(401, "Unauthorized")
         }
+    }
+
+    private func route(_ request: HTTPRequest) -> HTTPResponse {
         guard request.method == "GET" else { return .text(405, "Method not allowed") }
         let parts = request.path.split(separator: "/").map(String.init)
         switch parts.count {
@@ -184,10 +215,27 @@ private final class Session: @unchecked Sendable {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { [self] data, _, isComplete, error in
             buffer.append(data ?? Data())
             if let end = buffer.range(of: Data("\r\n\r\n".utf8)) {
+                guard var request = HTTPRequest.parse(buffer[..<end.lowerBound]) else {
+                    answered = true
+                    return send(.text(400, "Bad request"))
+                }
+                let length = request.contentLength
+                guard length <= HTTPRequest.maxBodyLength else {
+                    answered = true
+                    return send(.text(413, "Too large"))
+                }
+                // The body may come in later packets.
+                guard buffer.count - end.upperBound >= length else {
+                    return isComplete || error != nil ? connection.cancel() : receive()
+                }
                 answered = true
-                var request = HTTPRequest.parse(buffer[..<end.lowerBound])
-                if case .hostPort(let host, _) = connection.endpoint { request?.remoteAddress = Self.address(host) }
-                send(request.map(service.response) ?? .text(400, "Bad request"))
+                request.body = Data(buffer[end.upperBound..<end.upperBound + length])
+                if case .hostPort(let host, _) = connection.endpoint { request.remoteAddress = Self.address(host) }
+                let service = service
+                Task { [self] in
+                    let response = await service.respond(to: request)
+                    queue?.async { [self] in send(response) }
+                }
             } else if isComplete || error != nil || buffer.count > 65_536 {
                 connection.cancel()
             } else {
