@@ -55,10 +55,13 @@ struct DeviceRegistrationTests {
         let requests = OSAllocatedUnfairLock<[URLRequest]>(initialState: [])
         let existing: String?
         let createStatus: Int
+        /// The device's status once a create failed with 409: someone else registered it.
+        let existingAfterConflict: String?
 
-        init(existing: String? = nil, createStatus: Int = 201) {
+        init(existing: String? = nil, createStatus: Int = 201, existingAfterConflict: String? = nil) {
             self.existing = existing
             self.createStatus = createStatus
+            self.existingAfterConflict = existingAfterConflict
         }
 
         var send: AppStoreConnect.Send {
@@ -66,7 +69,8 @@ struct DeviceRegistrationTests {
                 requests.withLock { $0.append(request) }
                 switch request.httpMethod {
                 case "GET":
-                    let data = existing.map { #"[{"type":"devices","id":"D1","attributes":{"status":"\#($0)"}}]"# } ?? "[]"
+                    let posted = requests.withLock { $0.contains { $0.httpMethod == "POST" } }
+                    let data = (posted ? existingAfterConflict : existing).map { #"[{"type":"devices","id":"D1","attributes":{"status":"\#($0)"}}]"# } ?? "[]"
                     return (Data(#"{"data":\#(data)}"#.utf8), 200)
                 case "POST":
                     let body = createStatus == 409 ? #"{"errors":[{"detail":"A device with number already exists"}]}"# : "{}"
@@ -111,9 +115,17 @@ struct DeviceRegistrationTests {
         #expect(patch.httpMethod == "PATCH")
         #expect(patch.url?.lastPathComponent == "D1")
 
-        let raced = FakeAPI(createStatus: 409)
+        let raced = FakeAPI(createStatus: 409, existingAfterConflict: "ENABLED")
         #expect(try await AppStoreConnect(key: key, send: raced.send)
             .register(udid: "U", name: "N", platform: .iOS) == .alreadyRegistered)
+    }
+
+    /// App Store Connect also answers 409 to a full device list or an invalid UDID.
+    @Test func aConflictWithoutTheDeviceIsAnError() async {
+        let full = FakeAPI(createStatus: 409)
+        await #expect(throws: AppStoreConnectError.status(409, "A device with number already exists")) {
+            try await AppStoreConnect(key: key, send: full.send).register(udid: "U", name: "N", platform: .iOS)
+        }
     }
 
     @Test func explainsAKeyThatCannotRegister() async {
@@ -236,6 +248,42 @@ struct DeviceRegistrationTests {
         #expect(await service.respond(to: request).status == 401)
     }
 
+    /// A negative Content-Length used to make the body's range invalid and crash the builder,
+    /// before the token was even checked.
+    @Test func aNegativeContentLengthIsABadRequest() async throws {
+        let (server, client) = try await startServer(register: nil)
+        defer { server.stop() }
+        let port = try #require(client.link.baseURL.port)
+        let head = "POST /v1/devices HTTP/1.1\r\nHost: x\r\nContent-Length: -1\r\n\r\n"
+        let answer = try await Self.rawRequest(head, port: port)
+        #expect(answer.hasPrefix("HTTP/1.1 400"))
+    }
+
+    /// Sends `text` over a plain TCP connection and returns what comes back.
+    private static func rawRequest(_ text: String, port: Int) async throws -> String {
+        let task = Task.detached { () throws -> String in
+            let fd = socket(AF_INET, SOCK_STREAM, 0)
+            defer { close(fd) }
+            var address = sockaddr_in()
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = in_port_t(UInt16(port).bigEndian)
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            let connected = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard connected == 0 else { throw CocoaError(.fileReadUnknown) }
+            var timeout = timeval(tv_sec: 5, tv_usec: 0)
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+            _ = text.withCString { send(fd, $0, strlen($0), 0) }
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            let count = recv(fd, &buffer, buffer.count, 0)
+            return String(decoding: buffer.prefix(max(count, 0)), as: UTF8.self)
+        }
+        return try await task.value
+    }
+
     @Test func anUnknownStatusIsAFailure() throws {
         let result = try JSONDecoder().decode(DeviceRegistrationResult.self, from: Data(#"{"status":"queued"}"#.utf8))
         #expect(result.status == .failed)
@@ -259,6 +307,38 @@ struct DeviceRegistrationTests {
         #expect(runner.registrationRequests == [phone.id: .requested])
         // No build lists the phone as missing, so nothing keeps the request once the runner looks again.
         runner.config.devices = []
+        #expect(runner.registrationRequests.isEmpty)
+    }
+
+    /// If the builder's new build still leaves the device out, the button comes back.
+    @Test func aNewBuildWithoutTheDeviceEndsTheRequest() async throws {
+        let (server, client) = try await startServer { _, _ in DeviceRegistrationResult(status: .registered, rebuilding: true) }
+        defer { server.stop() }
+        let dir = try TemporaryDirectory()
+        func app(_ name: String) throws -> BuiltProduct {
+            try dir.makeDirectories("\(name)/App.app")
+            let plist = try PropertyListSerialization.data(
+                fromPropertyList: ["Name": "iOS Team Provisioning Profile: x", "ProvisionedDevices": ["OTHER"]],
+                format: .xml, options: 0)
+            try plist.write(to: dir.url.appendingPathComponent("\(name)/App.app/embedded.mobileprovision"))
+            return BuiltProduct(appURL: dir.url.appendingPathComponent("\(name)/App.app"), bundleIdentifier: "x")
+        }
+        var config = PipelineConfig(name: "App")
+        config.remoteID = UUID()
+        config.devices = [phone]
+        let runner = PipelineRunner(config: config)
+        runner.builder = client
+        var first = RunRecord(commit: String(repeating: "a", count: 40))
+        first.products = [BuildPlatform.iOS.rawValue: try app("first")]
+        runner.runs = [first]
+        #expect(runner.unprovisionedDevices == [phone.id])
+
+        _ = await runner.requestRegistration(of: phone)
+        #expect(runner.registrationRequests == [phone.id: .requested])
+        var second = RunRecord(commit: String(repeating: "b", count: 40))
+        second.products = [BuildPlatform.iOS.rawValue: try app("second")]
+        runner.runs = [second, first]
+        #expect(runner.unprovisionedDevices == [phone.id])
         #expect(runner.registrationRequests.isEmpty)
     }
 

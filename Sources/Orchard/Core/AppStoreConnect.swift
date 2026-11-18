@@ -131,9 +131,13 @@ struct AppStoreConnect: Sendable {
         do {
             _ = try await call("POST", "devices", body: body)
             return .registered
-        } catch AppStoreConnectError.status(409, _) {
-            // Registered by someone else in the meantime.
-            return .alreadyRegistered
+        } catch AppStoreConnectError.status(409, let detail) {
+            // 409 is also a full device list, an invalid UDID or name. Only a device that's
+            // there now was registered by someone else in the meantime.
+            let found = try? await devices(query: [URLQueryItem(name: "filter[udid]", value: udid),
+                                                   URLQueryItem(name: "limit", value: "1")])
+            if found?.first?.attributes?.status == "ENABLED" { return .alreadyRegistered }
+            throw AppStoreConnectError.status(409, detail)
         }
     }
 

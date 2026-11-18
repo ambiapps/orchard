@@ -130,6 +130,7 @@ final class PipelineRunner: Identifiable {
 
     private func checkProvisioning() {
         // Runs are newest first; going oldest to newest leaves each platform its newest app.
+        let before = checkedApps.mapValues(\.run)
         for run in runs.reversed() {
             for (key, product) in run.products ?? [:] {
                 guard let platform = BuildPlatform(rawValue: key) else { continue }
@@ -142,7 +143,14 @@ final class PipelineRunner: Identifiable {
         provisioningInputs = inputs
         let ids = Provisioning.unprovisioned(config.devices, apps: checkedApps.mapValues(\.app))
         if ids != unprovisionedDevices { unprovisionedDevices = ids }
-        let requests = registrationRequests.filter { ids.contains($0.key) || $0.value == .requesting }
+        // A request is done when its device is in the profile, or when a new build of its
+        // platform still leaves it out (the registration didn't take): then it can be asked again.
+        let rebuilt = Set(checkedApps.filter { before[$0.key] != $0.value.run }.keys)
+        let requests = registrationRequests.filter { id, state in
+            guard state == .requested else { return true }
+            let platform = config.devices.first { $0.id == id }?.platform
+            return ids.contains(id) && !(platform.map(rebuilt.contains) ?? false)
+        }
         if requests != registrationRequests { registrationRequests = requests }
     }
 
@@ -213,6 +221,11 @@ final class PipelineRunner: Identifiable {
         Task { await rebuildIfQueued() }
     }
 
+    private func resumeQueuedRebuild() {
+        guard rebuildQueued else { return }
+        Task { await rebuildIfQueued() }
+    }
+
     private func rebuildIfQueued() async {
         while rebuildQueued, runTask == nil, !status.isBusy {
             rebuildQueued = false
@@ -230,7 +243,9 @@ final class PipelineRunner: Identifiable {
             return DeviceRegistrationResult(
                 status: .failed, message: "Orchard doesn't know this device's UDID yet. Connect it to this Mac and try again.")
         }
-        guard registrationRequests[device.id] == nil else { return DeviceRegistrationResult(status: .registered) }
+        guard registrationRequests[device.id] == nil else {
+            return DeviceRegistrationResult(status: .failed, message: "This device was already requested.")
+        }
         registrationRequests[device.id] = .requesting
         let result: DeviceRegistrationResult
         do {
@@ -286,6 +301,8 @@ final class PipelineRunner: Identifiable {
 
     func check(force: Bool, newDevice: Device? = nil) async {
         guard runTask == nil else { return }
+        // A rebuild asked for while this check was going runs once it's done, whatever it found.
+        defer { resumeQueuedRebuild() }
         if let missing = config.missingSetup {
             lastError = missing
             return
@@ -328,7 +345,6 @@ final class PipelineRunner: Identifiable {
             runTask = task
             await task.value
             runTask = nil
-            if rebuildQueued { Task { await rebuildIfQueued() } }
         } catch is CancellationError {
         } catch {
             lastCheck = Date()
@@ -689,6 +705,7 @@ final class PipelineRunner: Identifiable {
         runTask = Task {
             await redeploy(product, to: device, run: run)
             runTask = nil
+            resumeQueuedRebuild()
         }
     }
 

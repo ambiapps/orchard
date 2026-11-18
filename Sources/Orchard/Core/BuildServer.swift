@@ -220,6 +220,11 @@ private final class Session: @unchecked Sendable {
                     return send(.text(400, "Bad request"))
                 }
                 let length = request.contentLength
+                // A negative length would make the body's range invalid and crash.
+                guard length >= 0 else {
+                    answered = true
+                    return send(.text(400, "Bad request"))
+                }
                 guard length <= HTTPRequest.maxBodyLength else {
                     answered = true
                     return send(.text(413, "Too large"))
@@ -232,6 +237,7 @@ private final class Session: @unchecked Sendable {
                 request.body = Data(buffer[end.upperBound..<end.upperBound + length])
                 if case .hostPort(let host, _) = connection.endpoint { request.remoteAddress = Self.address(host) }
                 let service = service
+                let queue = queue
                 Task { [self] in
                     let response = await service.respond(to: request)
                     queue?.async { [self] in send(response) }
