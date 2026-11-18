@@ -151,6 +151,55 @@ struct ProvisioningTests {
                 == "César's iPhone isn't in the team's provisioning profile; register it in the developer account")
     }
 
+    // MARK: Warning in the device list
+
+    private func run(_ products: [BuildPlatform: URL]) -> RunRecord {
+        var run = RunRecord(commit: "abc")
+        run.products = Dictionary(uniqueKeysWithValues: products.map {
+            ($0.key.rawValue, BuiltProduct(appURL: $0.value, bundleIdentifier: "com.example.app"))
+        })
+        return run
+    }
+
+    @Test func checksEachDeviceAgainstTheAppOfItsPlatform() throws {
+        let old = try TemporaryDirectory(), new = try TemporaryDirectory()
+        let oldApp = try makeApp(in: old, profiles: ["": [phoneUDID, padUDID]])
+        let newApp = try makeApp(in: new, profiles: ["": [padUDID]])
+        let phone = device("Phone", udid: phoneUDID), pad = device("Pad", udid: padUDID)
+        let watch = Device(id: "Watch", name: "Watch", model: "Watch", kind: .physical, platform: .watchOS,
+                           osVersion: "27.0", udid: "00008301-0000000000000000")
+        let unknown = device("Unknown", udid: nil), simulator = device("Sim", udid: nil, kind: .simulator)
+        // The new iOS build no longer lists the phone. There's no watchOS build.
+        #expect(Provisioning.unprovisioned([phone, pad, watch, unknown, simulator], apps: [.iOS: newApp]) == ["Phone"])
+        #expect(Provisioning.unprovisioned([phone, pad], apps: [.iOS: oldApp]).isEmpty)
+        #expect(Provisioning.unprovisioned([phone], apps: [:]).isEmpty)
+    }
+
+    @MainActor @Test func runnerWarnsAboutAChosenDeviceWhenABuildDoesNotListIt() throws {
+        let directory = try TemporaryDirectory()
+        let app = try makeApp(in: directory, profiles: ["": [padUDID]])
+        let phone = device("Phone", udid: phoneUDID), pad = device("Pad", udid: padUDID)
+        let runner = PipelineRunner(config: PipelineConfig(devices: [pad]))
+        #expect(runner.unprovisionedDevices.isEmpty)
+        runner.runs = [run([.iOS: app])]
+        #expect(runner.unprovisionedDevices.isEmpty)
+        runner.config.devices.append(phone)
+        #expect(runner.unprovisionedDevices == ["Phone"])
+        // A new run forgets the older products while it builds; the warning stays until a new app is there.
+        var building = RunRecord(commit: "def")
+        runner.runs.insert(building, at: 0)
+        runner.runs.forgetProducts(keeping: building.id)
+        #expect(runner.unprovisionedDevices == ["Phone"])
+        let fixed = try TemporaryDirectory()
+        building.products = [BuildPlatform.iOS.rawValue: BuiltProduct(
+            appURL: try makeApp(in: fixed, profiles: ["": [phoneUDID, padUDID]]), bundleIdentifier: "com.example.app")]
+        runner.runs[0] = building
+        #expect(runner.unprovisionedDevices.isEmpty)
+        runner.runs = [run([.iOS: app])]
+        runner.config.devices.removeAll { $0.id == "Phone" }
+        #expect(runner.unprovisionedDevices.isEmpty)
+    }
+
     // MARK: Removing cached profiles
 
     @Test func removesOnlyXcodeManagedProfiles() throws {

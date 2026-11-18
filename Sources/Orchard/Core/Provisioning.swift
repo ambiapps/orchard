@@ -74,6 +74,19 @@ enum Provisioning {
         }
     }
 
+    /// The ids of the devices among `devices` that the app built for their platform can't be
+    /// installed on. A platform with no app at hand, or one that needs no provisioning, has
+    /// nothing to check.
+    static func unprovisioned(_ devices: [Device], apps: [BuildPlatform: URL]) -> Set<String> {
+        var result: Set<String> = []
+        let physical = devices.filter { $0.kind == .physical && $0.platform.needsDeviceProvisioning }
+        for (platform, group) in Dictionary(grouping: physical, by: \.platform) {
+            guard let app = apps[platform] else { continue }
+            result.formUnion(devicesMissing(fromProfilesIn: app, devices: group).map(\.id))
+        }
+        return result
+    }
+
     /// Whether a profile in `app` that lacks one of `devices` is one Xcode manages, so deleting
     /// the cached copy and building again can produce a current one. A hand-made profile can't
     /// be refreshed that way.

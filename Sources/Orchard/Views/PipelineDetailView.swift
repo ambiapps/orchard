@@ -257,6 +257,14 @@ private struct DevicesSection: View {
                             Text(detail(for: row))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                            if isSelected(row.device), runner.unprovisionedDevices.contains(row.id) {
+                                Label("Not in the latest build's provisioning profile", systemImage: "exclamationmark.triangle.fill")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .help(runner.config.isRemote
+      ? "Installing will fail. The builder has to register the device with its team and build again."
+      : "Installing will fail. Register the device's UDID in the developer account, then build again.")
+                            }
                         }
                     }
                 }
