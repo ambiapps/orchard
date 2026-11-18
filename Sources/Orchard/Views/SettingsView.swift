@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The app-wide settings window (Orchard → Settings…).
 struct SettingsView: View {
@@ -52,6 +53,7 @@ struct SettingsView: View {
                             Text("Approved \(client.approvedAt.formatted(date: .abbreviated, time: .omitted))")
                         }
                     }
+                    AppStoreConnectKeyRow()
                 }
             } header: {
                 Text("Builder")
@@ -61,7 +63,9 @@ struct SettingsView: View {
                     Orchard, which install it on their own devices without Xcode or the source code. Give \
                     them the link. If they aren't on this network, replace the host name with one they can \
                     reach, such as this Mac's VPN or Tailscale name. A Mac that adds the link shows a code; \
-                    it gets builds only after you enter that code here.
+                    it gets builds only after you enter that code here. With an App Store Connect API key \
+                    (Admin role), approved Macs can ask this Mac to register their devices with your team; it \
+                    then builds again with a new profile.
                     """)
             }
 
@@ -181,5 +185,92 @@ private struct PairingRequestRow: View {
 
     private func approve() {
         wrongCode = !store.approve(request, code: code)
+    }
+}
+
+/// The builder's App Store Connect API key, with which it registers clients' devices.
+private struct AppStoreConnectKeyRow: View {
+    @Environment(AppStore.self) private var store
+    @State private var issuerID = ""
+    @State private var keyID = ""
+    @State private var privateKey: String?
+    @State private var fileName: String?
+    @State private var saving = false
+    @State private var error: String?
+    @State private var choosingFile = false
+
+    var body: some View {
+        if let key = store.appStoreConnectKey {
+            LabeledContent {
+                Button("Remove") { store.removeAppStoreConnectKey() }
+            } label: {
+                Text("App Store Connect key \(key.keyID)")
+                Text("Approved Macs can ask to register their devices")
+            }
+        } else {
+            // Separate rows, so the form lines them up with the others.
+            Group {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Register devices for approved Macs")
+                    Text("Add an App Store Connect API key from Users and Access → Integrations.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                TextField("Issuer ID", text: $issuerID, prompt: Text("57246542-96fe-1a63-e053-…"))
+                    .autocorrectionDisabled()
+                TextField("Key ID", text: $keyID, prompt: Text("2X9R4HXF34"))
+                    .autocorrectionDisabled()
+                LabeledContent("Private key") {
+                    HStack {
+                        Text(fileName ?? "None")
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        // Not NSOpenPanel.runModal(), which would hold up every pipeline while it's open.
+                        Button("Choose .p8 File…") { choosingFile = true }
+                            .fileImporter(isPresented: $choosingFile,
+                                          allowedContentTypes: [UTType(filenameExtension: "p8") ?? .data]) { result in
+                                if case .success(let url) = result { read(url) }
+                            }
+                    }
+                }
+                HStack {
+                    if let error {
+                        Text(error).font(.callout).foregroundStyle(.red)
+                    }
+                    Spacer()
+                    if saving { ProgressView().controlSize(.small) }
+                    Button("Add Key", action: save)
+                        .disabled(saving || privateKey == nil || issuerID.isEmpty || keyID.isEmpty)
+                }
+            }
+        }
+    }
+
+    private func read(_ url: URL) {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else {
+            error = "Couldn't read that file."
+            return
+        }
+        privateKey = text
+        fileName = url.lastPathComponent
+        error = nil
+        if keyID.isEmpty, let id = AppStoreConnectKey.keyID(fromFileName: url.lastPathComponent) { keyID = id }
+    }
+
+    private func save() {
+        guard let privateKey else { return }
+        let key = AppStoreConnectKey(issuerID: issuerID.trimmingCharacters(in: .whitespaces),
+                                     keyID: keyID.trimmingCharacters(in: .whitespaces), privateKey: privateKey)
+        saving = true
+        error = nil
+        Task {
+            do {
+                try await store.setAppStoreConnectKey(key)
+            } catch {
+                self.error = error.localizedDescription
+            }
+            saving = false
+        }
     }
 }

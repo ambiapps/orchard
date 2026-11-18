@@ -28,6 +28,38 @@ struct BuildCatalog: Codable, Sendable {
     var pipelines: [SharedPipeline]
 }
 
+/// What a client sends with `POST /v1/devices`: please register this device with your team
+/// and build the pipeline again.
+struct DeviceRegistrationRequest: Codable, Equatable, Sendable {
+    var pipeline: UUID
+    var name: String
+    var udid: String
+    var platform: BuildPlatform
+}
+
+/// The builder's answer to a `DeviceRegistrationRequest`.
+struct DeviceRegistrationResult: Codable, Equatable, Sendable {
+    enum Status: String, Codable, Sendable {
+        case registered
+        case alreadyRegistered
+        /// The builder can't register devices: it has no App Store Connect key, or runs an
+        /// Orchard that doesn't know the request.
+        case unavailable
+        case failed
+
+        /// A status a later version adds counts as a failure.
+        init(from decoder: Decoder) throws {
+            self = Status(rawValue: try decoder.singleValueContainer().decode(String.self)) ?? .failed
+        }
+    }
+    var status: Status
+    var message: String?
+    /// Whether the builder started a new build for the pipeline.
+    var rebuilding: Bool?
+
+    static let unavailable = DeviceRegistrationResult(status: .unavailable)
+}
+
 /// The address a client enters: `http://host:port`. Links from Orchard 1.0.15 and earlier end in
 /// `#token`; that part is ignored, because each client now gets its own token by being approved.
 struct BuilderLink: Hashable, Sendable {
@@ -221,6 +253,25 @@ enum BuilderError: LocalizedError, Equatable {
 struct BuilderClient: Equatable, Sendable {
     var link: BuilderLink
     var identity: ClientIdentity
+
+    /// Asks the builder to register a device with its team and build again. A builder that
+    /// doesn't know the request (Orchard 1.0.18 or earlier) counts as one that can't register.
+    func registerDevice(_ registration: DeviceRegistrationRequest) async throws -> DeviceRegistrationResult {
+        var request = request("v1/devices")
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(registration)
+        // Registering talks to Apple before the builder answers.
+        request.timeoutInterval = 90
+        let (data, response) = try await Self.cancellable { try await URLSession.shared.data(for: request) }
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if status == 404 || status == 405 {
+            return DeviceRegistrationResult(
+                status: .unavailable, message: "The builder runs an older Orchard that can't register devices.")
+        }
+        try check(response)
+        return try JSONDecoder().decode(DeviceRegistrationResult.self, from: data)
+    }
 
     func catalog() async throws -> BuildCatalog {
         var request = request("v1/builds")

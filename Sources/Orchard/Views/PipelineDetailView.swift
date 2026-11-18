@@ -243,6 +243,7 @@ struct PipelineSettingsView: View {
 private struct DevicesSection: View {
     @Bindable var runner: PipelineRunner
     @Environment(AppStore.self) private var store
+    @State private var alert: RegistrationAlert?
 
     var body: some View {
         Section {
@@ -258,12 +259,7 @@ private struct DevicesSection: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             if isSelected(row.device), runner.unprovisionedDevices.contains(row.id) {
-                                Label("Not in the latest build's provisioning profile", systemImage: "exclamationmark.triangle.fill")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                                    .help(runner.config.isRemote
-      ? "Installing will fail. The builder has to register the device with its team and build again."
-      : "Installing will fail. Register the device's UDID in the developer account, then build again.")
+                                ProvisioningWarning(runner: runner, device: selected(row.device), alert: $alert)
                             }
                         }
                     }
@@ -316,6 +312,23 @@ private struct DevicesSection: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
+        .alert(alert?.title ?? "", isPresented: Binding(get: { alert != nil }, set: { if !$0 { alert = nil } }),
+               presenting: alert) { alert in
+            if let udid = alert.udid {
+                Button("Copy UDID") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(udid, forType: .string)
+                }
+            }
+            Button("OK", role: .cancel) {}
+        } message: { alert in
+            Text(alert.message)
+        }
+    }
+
+    /// The chosen device as saved, which has its UDID, rather than as discovered.
+    private func selected(_ device: Device) -> Device {
+        runner.config.devices.first { $0.id == device.id } ?? device
     }
 
     /// Discovered devices, plus selected ones that aren't currently visible: enabled ones first, then available ones.
@@ -353,6 +366,73 @@ private struct DevicesSection: View {
             withAnimation {
                 runner.config.devices.removeAll { $0.id == device.id }
                 if isOn { runner.config.devices.append(device) }
+            }
+        }
+    }
+}
+
+/// Why a request to register a device came to nothing.
+struct RegistrationAlert: Equatable {
+    var title: String
+    var message: String
+    /// Offered for copying when someone has to register the device by hand.
+    var udid: String?
+
+    /// Nil when the builder registered the device; the row says so instead.
+    static func from(_ result: DeviceRegistrationResult, device: Device, builder: String) -> RegistrationAlert? {
+        switch result.status {
+        case .registered, .alreadyRegistered: return nil
+        case .unavailable:
+            return RegistrationAlert(
+                title: "\(builder) can't register devices",
+                message: (result.message.map { $0 + " " } ?? "It has no App Store Connect API key. ")
+                    + "Ask someone there to add one in Orchard's Settings, or to register \(device.name) in the "
+                    + "Apple Developer account and build again."
+                    + (device.udid.map { " Its UDID is \($0)." } ?? ""),
+                udid: device.udid)
+        case .failed:
+            return RegistrationAlert(title: "Couldn't register \(device.name)",
+                                     message: result.message ?? "The builder didn't say why.", udid: device.udid)
+        }
+    }
+}
+
+/// Under a chosen device that the latest build's profile doesn't list. On a client pipeline,
+/// with a button that asks the builder to register the device.
+private struct ProvisioningWarning: View {
+    let runner: PipelineRunner
+    let device: Device
+    @Binding var alert: RegistrationAlert?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Not in the latest build's provisioning profile", systemImage: "exclamationmark.triangle.fill")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .help(runner.config.isRemote
+                      ? "Installing will fail. The builder has to register the device with its team and build again."
+                      : "Installing will fail. Register the device's UDID in the developer account, then build again.")
+            if runner.config.isRemote {
+                switch runner.registrationRequests[device.id] {
+                case .requesting:
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.mini)
+                        Text("Asking the builder…").font(.caption).foregroundStyle(.secondary)
+                    }
+                case .requested:
+                    Label("Registered; waiting for the builder's new build", systemImage: "clock")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                case nil:
+                    Button("Request to Be Added") {
+                        Task {
+                            let result = await runner.requestRegistration(of: device)
+                            alert = .from(result, device: device, builder: runner.config.builderLabel ?? "The builder")
+                        }
+                    }
+                    .controlSize(.small)
+                    .help("Asks the builder to register this device with its team and build again")
+                }
             }
         }
     }
