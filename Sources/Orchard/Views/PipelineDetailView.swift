@@ -166,14 +166,12 @@ struct PipelineSettingsView: View {
                 }
                 if store.sharesBuilds {
                     Picker("Also build for", selection: $runner.config.alsoBuilds) {
-                        // With no devices of its own, a builder builds everything the scheme supports.
-                        Text(runner.config.devices.isEmpty ? "Every platform the scheme supports" : "Chosen devices only")
-                            .tag(BuildPlatform?.none)
+                        Text("Every platform the scheme supports").tag(BuildPlatform?.none)
                         ForEach(BuildPlatform.allCases.filter { !$0.isSimulator }, id: \.self) {
                             Text($0.displayName).tag(BuildPlatform?.some($0))
                         }
                     }
-                    .help("Build this platform for clients even when none of this Mac's devices needs it")
+                    .help("Which platforms to build for clients, besides those of this Mac's own devices")
                 }
             }
     }
