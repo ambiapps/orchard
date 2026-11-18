@@ -135,6 +135,8 @@ struct ContentViewLayoutTests {
             try clientSnapshot(appearance: appearance, deviceSupport: .missing,
                                to: directory.appendingPathComponent("client-setup-\(name).png"))
             try builderSnapshot(appearance: appearance, to: directory.appendingPathComponent("builder-\(name).png"))
+            try builderSnapshot(appearance: appearance, hosted: true,
+                                to: directory.appendingPathComponent("builder-no-devices-\(name).png"))
 
             let store = makeTestStore()
             let runner = store.pipelines[0]
@@ -214,12 +216,19 @@ struct ContentViewLayoutTests {
             url.lastPathComponent.replacingOccurrences(of: "client", with: "sidebar")))
     }
 
-    /// A builder's pipeline, with the platform it also builds for its clients.
-    private func builderSnapshot(appearance: NSAppearance.Name, to url: URL) throws {
+    /// A builder's pipeline, with the platform it also builds for its clients, or with no devices
+    /// and no platform chosen (`hosted`), when it builds every platform the scheme supports.
+    private func builderSnapshot(appearance: NSAppearance.Name, hosted: Bool = false, to url: URL) throws {
         let store = makeTestStore()
         store.sharesBuilds = true
         let runner = store.pipelines[0]
-        runner.config.alsoBuilds = .iOS
+        if hosted {
+            runner.config.repoPath = "/Users/me/Developer/App"
+            runner.config.branch = "main"
+            runner.config.scheme = "App"
+        } else {
+            runner.config.alsoBuilds = .iOS
+        }
         let view = ContentView()
             .environment(store)
             .frame(minWidth: Layout.windowMinWidth, minHeight: Layout.windowMinHeight)

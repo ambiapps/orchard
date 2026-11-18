@@ -370,6 +370,21 @@ struct SharingTests {
         #expect(runner.runs.isEmpty)
     }
 
+    /// A host may have no devices of its own, and needn't pick a platform: it builds every
+    /// platform the scheme supports.
+    @Test func aBuilderWithoutDevicesOrPlatformsStillChecks() async {
+        let runner = PipelineRunner(
+            config: PipelineConfig(repoPath: "/nowhere", branch: "main", scheme: "App"),
+            deployer: { _, _, _ in })
+        runner.sharesBuilds = true
+        #expect(runner.missingSetup == nil)
+        await runner.check(force: true)
+        // It got as far as asking git for the branch head.
+        #expect(runner.lastError != nil)
+        #expect(runner.lastError != "Choose at least one device")
+        #expect(runner.log.contains { $0.text.hasPrefix("Couldn't check main") })
+    }
+
     @Test func remotePipelineWaitsForTheBuildersFirstBuild() async throws {
         let builderRoot = try TemporaryDirectory()
         let shared = PipelineConfig(name: "App")
@@ -608,16 +623,19 @@ struct SharingTests {
 
     @Test func aRemotePipelineNeedsOnlyDevices() {
         var config = PipelineConfig(remoteID: UUID())
-        #expect(config.missingSetup == "Choose at least one device")
+        #expect(config.missingSetup(sharesBuilds: true) == "Choose at least one device")
         config.devices = [.thisMac]
-        #expect(config.missingSetup == nil)
+        #expect(config.missingSetup(sharesBuilds: false) == nil)
     }
 
     @Test func aBuilderCanBuildWithoutDevices() {
         var config = PipelineConfig(repoPath: "/repo", branch: "main", scheme: "App")
-        #expect(config.missingSetup == "Choose at least one device")
+        #expect(config.missingSetup(sharesBuilds: false) == "Choose at least one device")
+        #expect(config.missingSetup(sharesBuilds: true) == nil)
         config.alsoBuilds = .iOS
-        #expect(config.missingSetup == nil)
+        // "Also build for" only counts on a builder.
+        #expect(config.missingSetup(sharesBuilds: false) == "Choose at least one device")
+        #expect(config.missingSetup(sharesBuilds: true) == nil)
         #expect(config.buildPlatforms == [.iOS])
         config.devices = [.thisMac]
         #expect(config.buildPlatforms == [.iOS, .macOS])

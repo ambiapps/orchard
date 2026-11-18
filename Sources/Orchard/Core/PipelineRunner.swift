@@ -93,7 +93,7 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var newDevices: [Device] = []
     @ObservationIgnored private let deployer: DeployAction
     /// Whether this Mac is a builder: each build is then also zipped for its clients. Set by `AppStore`.
-    @ObservationIgnored var sharesBuilds = false
+    var sharesBuilds = false
     /// The builder a remote pipeline (`config.remoteID`) gets its builds from. Set by `AppStore`.
     @ObservationIgnored var builder: BuilderClient?
     @ObservationIgnored private let sharedRoot: URL
@@ -288,6 +288,9 @@ final class PipelineRunner: Identifiable {
         }
     }
 
+    /// What's left to set up before the pipeline can run; nil when it can.
+    var missingSetup: String? { config.missingSetup(sharesBuilds: sharesBuilds) }
+
     func cancelRun() {
         runTask?.cancel()
     }
@@ -303,17 +306,12 @@ final class PipelineRunner: Identifiable {
         guard runTask == nil else { return }
         // A rebuild asked for while this check was going runs once it's done, whatever it found.
         defer { resumeQueuedRebuild() }
-        if let missing = config.missingSetup {
+        if let missing = missingSetup {
             lastError = missing
             return
         }
         if let remoteID = config.remoteID {
             await checkRemote(remoteID, force: force, newDevice: newDevice)
-            return
-        }
-        // "Also build for" only counts on a builder; without sharing there'd be nothing to do.
-        if config.devices.isEmpty, !sharesBuilds {
-            lastError = "Choose at least one device"
             return
         }
         guard let repo = config.repoURL, let branch = config.branch else { return }
@@ -394,7 +392,16 @@ final class PipelineRunner: Identifiable {
 
             let groups = Dictionary(grouping: config.devices, by: \.platform)
             // A builder also builds a platform none of its own devices needs, for its clients.
-            let platforms = sharesBuilds ? config.buildPlatforms : Set(groups.keys)
+            var platforms = sharesBuilds ? config.buildPlatforms : Set(groups.keys)
+            if platforms.isEmpty {
+                // A builder with no devices of its own (a headless host): build everything the
+                // scheme supports, since it can't know which devices its clients have.
+                append(.step, "No devices on this Mac; looking up the platforms \(scheme) supports")
+                platforms = try await Xcode.supportedPlatforms(
+                    container: config.containerPath, scheme: scheme, in: dirs.checkout)
+                append(.info, "Building for clients: "
+                    + BuildPlatform.allCases.filter(platforms.contains).map(\.displayName).joined(separator: ", "))
+            }
             if sharesBuilds { SharedBuilds.remove(pipeline: config.id, keeping: platforms, root: sharedRoot) }
             for platform in BuildPlatform.allCases where platforms.contains(platform) {
                 var devices = groups[platform] ?? []

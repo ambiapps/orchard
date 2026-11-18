@@ -5,16 +5,16 @@ import Testing
 struct PipelineConfigTests {
     @Test func reportsFirstMissingSetupStep() {
         var config = PipelineConfig()
-        #expect(config.missingSetup == "Choose a repository")
+        #expect(config.missingSetup(sharesBuilds: false) == "Choose a repository")
         config.repoPath = "/tmp/repo"
-        #expect(config.missingSetup == "Choose a branch")
+        #expect(config.missingSetup(sharesBuilds: false) == "Choose a branch")
         config.branch = "main"
-        #expect(config.missingSetup == "Choose a scheme")
+        #expect(config.missingSetup(sharesBuilds: false) == "Choose a scheme")
         config.scheme = "App"
-        #expect(config.missingSetup == "Choose at least one device")
+        #expect(config.missingSetup(sharesBuilds: false) == "Choose at least one device")
         config.devices = [Device(id: "sim", name: "iPhone", model: "iPhone", kind: .simulator,
                                  platform: .iOSSimulator, osVersion: "18.0")]
-        #expect(config.missingSetup == nil)
+        #expect(config.missingSetup(sharesBuilds: false) == nil)
     }
 
     @Test func roundTripsThroughJSON() throws {

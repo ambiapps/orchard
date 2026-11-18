@@ -18,7 +18,7 @@ struct PipelineDetailView: View {
                     } else {
                         Button(runner.config.isRemote ? "Install Now" : "Build & Deploy Now",
                                systemImage: runner.config.isRemote ? "arrow.down.circle" : "hammer") { runner.buildNow() }
-                            .disabled(runner.config.missingSetup != nil || runner.status.isBusy)
+                            .disabled(runner.missingSetup != nil || runner.status.isBusy)
                     }
                     Toggle(isOn: $runner.config.isEnabled) {
                         Label(runner.config.isEnabled ? "Enabled" : "Enable",
@@ -26,8 +26,8 @@ struct PipelineDetailView: View {
                     }
                     .toggleStyle(.button)
                     .tint(runner.config.isEnabled ? .green : nil)
-                    .disabled(runner.config.missingSetup != nil && !runner.config.isEnabled)
-                    .help(runner.config.missingSetup ?? (runner.config.isRemote
+                    .disabled(runner.missingSetup != nil && !runner.config.isEnabled)
+                    .help(runner.missingSetup ?? (runner.config.isRemote
                         ? "Ask the builder for new builds and install each one"
                         : "Poll the branch and deploy every new commit"))
                 }
@@ -166,7 +166,9 @@ struct PipelineSettingsView: View {
                 }
                 if store.sharesBuilds {
                     Picker("Also build for", selection: $runner.config.alsoBuilds) {
-                        Text("Chosen devices only").tag(BuildPlatform?.none)
+                        // With no devices of its own, a builder builds everything the scheme supports.
+                        Text(runner.config.devices.isEmpty ? "Every platform the scheme supports" : "Chosen devices only")
+                            .tag(BuildPlatform?.none)
                         ForEach(BuildPlatform.allCases.filter { !$0.isSimulator }, id: \.self) {
                             Text($0.displayName).tag(BuildPlatform?.some($0))
                         }
