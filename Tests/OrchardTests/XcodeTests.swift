@@ -97,6 +97,9 @@ struct XcodeTests {
         // No target named like the scheme: the first app.
         #expect(try Xcode.supportedPlatforms(inBuildSettings: data, scheme: "Other") == [.watchOS])
         #expect(try Xcode.supportedPlatforms(inBuildSettings: Data("[]".utf8), scheme: "App").isEmpty)
+        // An iOS app with Mac Catalyst reports `macosx` too; that isn't a macOS app.
+        let catalyst = #"[{"target": "App", "buildSettings": {"WRAPPER_EXTENSION": "app", "SUPPORTS_MACCATALYST": "YES", "SUPPORTED_PLATFORMS": "iphoneos iphonesimulator macosx"}}]"#
+        #expect(try Xcode.supportedPlatforms(inBuildSettings: Data(catalyst.utf8), scheme: "App") == [.iOS])
     }
 
     @Test func containerDisplayName() {

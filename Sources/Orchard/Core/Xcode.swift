@@ -126,12 +126,15 @@ enum Xcode {
 
     /// The device platforms of the scheme's app target in `-showBuildSettings -json` output: the
     /// target named like the scheme, else the first app. Other apps (an embedded watch app) are
-    /// built as part of it, not on their own.
+    /// built as part of it, not on their own. Mac Catalyst doesn't count as macOS.
     static func supportedPlatforms(inBuildSettings data: Data, scheme: String) throws -> Set<BuildPlatform> {
         let targets = try JSONDecoder().decode([TargetSettings].self, from: data)
         let apps = targets.filter { $0.buildSettings["WRAPPER_EXTENSION"] == "app" }
         guard let app = apps.first(where: { $0.target == scheme }) ?? apps.first else { return [] }
-        let names = (app.buildSettings["SUPPORTED_PLATFORMS"] ?? "").split(separator: " ").map(String.init)
+        var names = Set((app.buildSettings["SUPPORTED_PLATFORMS"] ?? "").split(separator: " ").map(String.init))
+        // An iOS app that also runs as Mac Catalyst lists `macosx` too, but building it for
+        // `platform=macOS` makes a Catalyst app nobody asked for, in a folder `builtApp` doesn't look in.
+        if app.buildSettings["SUPPORTS_MACCATALYST"] == "YES" { names.remove("macosx") }
         return Set(BuildPlatform.allCases.filter { !$0.isSimulator && names.contains($0.platformName) })
     }
 
