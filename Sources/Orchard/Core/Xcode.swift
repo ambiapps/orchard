@@ -117,7 +117,10 @@ enum Xcode {
         "DEBUG_INFORMATION_FORMAT=dwarf",
         // Each pipeline keeps its own DerivedData, so builds are already incremental, and Xcode
         // never trims the compilation cache: it grew to 20 GB for one pipeline.
+        // The per-compiler settings default to it, but a project can turn them on by themselves.
         "COMPILATION_CACHE_ENABLE_CACHING=NO",
+        "SWIFT_ENABLE_COMPILE_CACHE=NO",
+        "CLANG_ENABLE_COMPILE_CACHE=NO",
     ]
 
     /// Deletes the compilation cache that builds before caching was turned off left in

@@ -35,6 +35,8 @@ struct XcodeTests {
 
     @Test func buildsWithoutCompilationCaching() {
         #expect(Xcode.buildSettingOverrides.contains("COMPILATION_CACHE_ENABLE_CACHING=NO"))
+        #expect(Xcode.buildSettingOverrides.contains("SWIFT_ENABLE_COMPILE_CACHE=NO"))
+        #expect(Xcode.buildSettingOverrides.contains("CLANG_ENABLE_COMPILE_CACHE=NO"))
         #expect(Xcode.buildSettingOverrides.contains("DEBUG_INFORMATION_FORMAT=dwarf"))
     }
 
