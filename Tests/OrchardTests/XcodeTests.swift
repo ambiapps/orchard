@@ -33,6 +33,28 @@ struct XcodeTests {
             == "/DD/Build/Products/Debug")
     }
 
+    @Test func buildsWithoutCompilationCaching() {
+        #expect(Xcode.buildSettingOverrides.contains("COMPILATION_CACHE_ENABLE_CACHING=NO"))
+        #expect(Xcode.buildSettingOverrides.contains("DEBUG_INFORMATION_FORMAT=dwarf"))
+    }
+
+    @Test func removesAStaleCompilationCacheOnly() throws {
+        let derivedData = try TemporaryDirectory()
+        // Nothing to remove: no error.
+        Xcode.removeCompilationCache(derivedData: derivedData.url)
+
+        try derivedData.makeDirectories("CompilationCache.noindex/generic/v1", "Build/Products/Debug-iphoneos")
+        try derivedData.write("CompilationCache.noindex/generic/v1/data", "cached")
+        #expect(Xcode.compilationCache(derivedData: derivedData.url).path
+            == derivedData.url.appendingPathComponent("CompilationCache.noindex").path)
+
+        Xcode.removeCompilationCache(derivedData: derivedData.url)
+        let files = FileManager.default
+        #expect(!files.fileExists(atPath: derivedData.url.appendingPathComponent("CompilationCache.noindex").path))
+        // Incremental build products stay.
+        #expect(files.fileExists(atPath: derivedData.url.appendingPathComponent("Build/Products/Debug-iphoneos").path))
+    }
+
     @Test func findsTheAppThisBuildSigned() throws {
         let buildStart = Date()
         let products = try TemporaryDirectory()

@@ -78,9 +78,9 @@ enum Xcode {
             common += ["-allowProvisioningUpdates", "-allowProvisioningDeviceRegistration"]
         }
 
-        // Deploys don't need dSYMs, and generating one for a large app takes tens of seconds.
+        removeCompilationCache(derivedData: derivedData)
         let buildStart = Date()
-        try await Shell.run("/usr/bin/xcodebuild", common + ["DEBUG_INFORMATION_FORMAT=dwarf", "build"],
+        try await Shell.run("/usr/bin/xcodebuild", common + buildSettingOverrides + ["build"],
                             in: checkout, onLine: log)
 
         // `-showBuildSettings` reloads the whole workspace, which can take a minute for big ones.
@@ -109,6 +109,25 @@ enum Xcode {
             throw XcodeError.productMissing(url)
         }
         return BuiltProduct(appURL: url, bundleIdentifier: bundleID)
+    }
+
+    /// Build settings every build overrides.
+    static let buildSettingOverrides = [
+        // Deploys don't need dSYMs, and generating one for a large app takes tens of seconds.
+        "DEBUG_INFORMATION_FORMAT=dwarf",
+        // Each pipeline keeps its own DerivedData, so builds are already incremental, and Xcode
+        // never trims the compilation cache: it grew to 20 GB for one pipeline.
+        "COMPILATION_CACHE_ENABLE_CACHING=NO",
+    ]
+
+    /// Deletes the compilation cache that builds before caching was turned off left in
+    /// `derivedData`, so upgraded Macs get the space back. Errors are ignored: it's only cleanup.
+    static func removeCompilationCache(derivedData: URL) {
+        try? FileManager.default.removeItem(at: compilationCache(derivedData: derivedData))
+    }
+
+    static func compilationCache(derivedData: URL) -> URL {
+        derivedData.appendingPathComponent("CompilationCache.noindex", isDirectory: true)
     }
 
     /// The device platforms (not simulators) `scheme`'s app supports, from `SUPPORTED_PLATFORMS`.
