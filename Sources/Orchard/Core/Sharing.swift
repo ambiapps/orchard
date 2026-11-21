@@ -18,6 +18,24 @@ struct SharedPipeline: Codable, Hashable, Sendable, Identifiable {
     var id: UUID
     var name: String
     var builds: [SharedBuild]
+    /// Builds of the branch's open pull requests, when the builder builds them; nil from a
+    /// builder that doesn't (or runs Orchard 1.0.21 or earlier).
+    var pullRequests: [SharedPullRequest]?
+}
+
+/// A pull request the builder built, with the builds of its newest head that built.
+struct SharedPullRequest: Codable, Hashable, Sendable, Identifiable {
+    var number: Int
+    var title: String
+    var author: String?
+    var url: String?
+    var branch: String?
+    /// The head commit last built. A platform that failed to build for it may still have the
+    /// build of an earlier commit; each build says which commit it is.
+    var commit: String
+    var builds: [SharedBuild]
+
+    var id: Int { number }
 }
 
 /// What `GET /v1/builds` returns.
@@ -129,7 +147,13 @@ enum SharedBuilds {
     @discardableResult
     static func publish(_ product: BuiltProduct, platform: BuildPlatform, commit: String, subject: String?,
                         pipeline: PipelineConfig, root: URL = Paths.pipelines) async throws -> SharedBuild {
-        let directory = directory(pipeline: pipeline.id, root: root)
+        try await publish(product, platform: platform, commit: commit, subject: subject, pipelineName: pipeline.name,
+                          in: directory(pipeline: pipeline.id, root: root))
+    }
+
+    /// Zips `product` into `directory` as its build for `platform`, replacing the one before.
+    private static func publish(_ product: BuiltProduct, platform: BuildPlatform, commit: String, subject: String?,
+                                pipelineName: String, in directory: URL) async throws -> SharedBuild {
         let fm = FileManager.default
         try fm.createDirectory(at: directory, withIntermediateDirectories: true)
         let json = directory.appendingPathComponent("\(platform.rawValue).json")
@@ -145,10 +169,90 @@ enum SharedBuilds {
         }
         build.size = (try? fm.attributesOfItem(atPath: staging.path)[.size] as? Int64) ?? 0
         try fm.moveItem(at: staging, to: archiveURL(build.id, in: directory))
-        try JSONEncoder().encode(Entry(pipeline: pipeline.name, build: build)).write(to: json, options: .atomic)
+        try JSONEncoder().encode(Entry(pipeline: pipelineName, build: build)).write(to: json, options: .atomic)
         // A download of the old archive that's under way keeps its open file.
         if let previous { try? fm.removeItem(at: archiveURL(previous.id, in: directory)) }
         return build
+    }
+
+    /// The builds in `directory`, newest first.
+    private static func entries(in directory: URL) -> [Entry] {
+        ((try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.pathExtension == "json" }
+            .compactMap { try? JSONDecoder().decode(Entry.self, from: Data(contentsOf: $0)) }
+            .sorted { $0.build.builtAt > $1.build.builtAt }
+    }
+
+    // MARK: Pull requests
+
+    /// `Pipelines/<id>/PullRequests/<number>/`: a pull request's builds, like the branch's,
+    /// and `pull-request.info` (JSON) once one of its heads has built. Outside `Shared`, so that
+    /// pruning the branch's platforms leaves them alone.
+    static func pullRequestsDirectory(pipeline id: UUID, root: URL = Paths.pipelines) -> URL {
+        root.appendingPathComponent("\(id.uuidString)/PullRequests", isDirectory: true)
+    }
+
+    private static func pullRequestDirectory(_ number: Int, pipeline id: UUID, root: URL) -> URL {
+        pullRequestsDirectory(pipeline: id, root: root).appendingPathComponent("\(number)", isDirectory: true)
+    }
+
+    private static func pullRequestInfoURL(in directory: URL) -> URL {
+        directory.appendingPathComponent("pull-request.info")
+    }
+
+    /// Zips `product` as the pull request's build for `platform`. Call `finishPullRequest`
+    /// after its platforms are built.
+    @discardableResult
+    static func publish(_ product: BuiltProduct, platform: BuildPlatform, subject: String?, pullRequest: PullRequest,
+                        pipeline: PipelineConfig, root: URL = Paths.pipelines) async throws -> SharedBuild {
+        try await publish(product, platform: platform, commit: pullRequest.headCommit, subject: subject,
+                          pipelineName: pipeline.name,
+                          in: pullRequestDirectory(pullRequest.number, pipeline: pipeline.id, root: root))
+    }
+
+    /// Records `pullRequest`'s head as built, so clients see the pull request and the builder
+    /// doesn't build that head again.
+    static func finishPullRequest(_ pullRequest: PullRequest, pipeline id: UUID, root: URL = Paths.pipelines) throws {
+        let directory = pullRequestDirectory(pullRequest.number, pipeline: id, root: root)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try JSONEncoder().encode(pullRequest).write(to: pullRequestInfoURL(in: directory), options: .atomic)
+    }
+
+    /// The pipeline's built pull requests, most recently built first.
+    static func pullRequests(pipeline id: UUID, root: URL = Paths.pipelines) -> [SharedPullRequest] {
+        let base = pullRequestsDirectory(pipeline: id, root: root)
+        return ((try? FileManager.default.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)) ?? [])
+            .compactMap { directory -> (SharedPullRequest, Date)? in
+                guard let info = try? JSONDecoder().decode(
+                    PullRequest.self, from: Data(contentsOf: pullRequestInfoURL(in: directory))) else { return nil }
+                let builds = entries(in: directory).map(\.build)
+                guard let newest = builds.first else { return nil }
+                return (SharedPullRequest(number: info.number, title: info.title, author: info.author, url: info.url,
+                                          branch: info.headBranch, commit: info.headCommit, builds: builds),
+                        newest.builtAt)
+            }
+            .sorted { $0.1 > $1.1 }
+            .map(\.0)
+    }
+
+    /// The head commit last built of each pull request, by number.
+    static func builtPullRequests(pipeline id: UUID, root: URL = Paths.pipelines) -> [Int: String] {
+        Dictionary(pullRequests(pipeline: id, root: root).map { ($0.number, $0.commit) }) { first, _ in first }
+    }
+
+    /// Deletes the builds of pull requests not in `keeping` (closed, merged, or no longer among
+    /// the most recently updated); of all of them when it's empty.
+    static func removePullRequests(pipeline id: UUID, keeping: Set<Int> = [], root: URL = Paths.pipelines) {
+        let fm = FileManager.default
+        let base = pullRequestsDirectory(pipeline: id, root: root)
+        guard !keeping.isEmpty else {
+            try? fm.removeItem(at: base)
+            return
+        }
+        for name in (try? fm.contentsOfDirectory(atPath: base.path)) ?? []
+        where !(Int(name).map(keeping.contains) ?? false) {
+            try? fm.removeItem(at: base.appendingPathComponent(name))
+        }
     }
 
     private static func archiveURL(_ build: UUID, in directory: URL) -> URL {
@@ -176,7 +280,9 @@ enum SharedBuilds {
     static func removeAll(root: URL = Paths.pipelines) {
         try? FileManager.default.removeItem(at: listURL(root: root))
         for name in (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [] {
-            if let id = UUID(uuidString: name) { remove(pipeline: id, root: root) }
+            guard let id = UUID(uuidString: name) else { continue }
+            remove(pipeline: id, root: root)
+            removePullRequests(pipeline: id, root: root)
         }
     }
 
@@ -190,21 +296,24 @@ enum SharedBuilds {
         for id in ((try? fm.contentsOfDirectory(atPath: root.path)) ?? []).compactMap(UUID.init(uuidString:))
         where names[id] == nil { ids.append(id) }
         return ids.compactMap { id -> SharedPipeline? in
-            let directory = directory(pipeline: id, root: root)
-            let entries = ((try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)) ?? [])
-                .filter { $0.pathExtension == "json" }
-                .compactMap { try? JSONDecoder().decode(Entry.self, from: Data(contentsOf: $0)) }
-                .sorted { $0.build.builtAt > $1.build.builtAt }
+            let entries = entries(in: directory(pipeline: id, root: root))
             guard let name = names[id] ?? entries.first?.pipeline else { return nil }
-            return SharedPipeline(id: id, name: name, builds: entries.map(\.build))
+            let pullRequests = pullRequests(pipeline: id, root: root)
+            return SharedPipeline(id: id, name: name, builds: entries.map(\.build),
+                                  pullRequests: pullRequests.isEmpty ? nil : pullRequests)
         }
         .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
     /// The archive of `build`, if it's still one the pipeline shares.
     static func archive(pipeline id: UUID, build: UUID, root: URL = Paths.pipelines) -> URL? {
-        let archive = archiveURL(build, in: directory(pipeline: id, root: root))
-        return FileManager.default.fileExists(atPath: archive.path) ? archive : nil
+        let fm = FileManager.default
+        let pullRequests = pullRequestsDirectory(pipeline: id, root: root)
+        let directories = [directory(pipeline: id, root: root)]
+            + ((try? fm.contentsOfDirectory(atPath: pullRequests.path)) ?? [])
+                .filter { Int($0) != nil }
+                .map { pullRequests.appendingPathComponent($0, isDirectory: true) }
+        return directories.map { archiveURL(build, in: $0) }.first { fm.fileExists(atPath: $0.path) }
     }
 
     /// Unpacks a downloaded archive into `directory` (replacing what's there) and returns its app.

@@ -208,6 +208,86 @@ struct SharingTests {
         #expect(SharedBuilds.catalog(root: root.url).isEmpty)
     }
 
+    // MARK: Pull requests
+
+    @Test func pullRequestBuildsAreSharedNextToTheBranchs() async throws {
+        let root = try TemporaryDirectory()
+        let pipeline = PipelineConfig(name: "App")
+        let product = try makeApp(in: root)
+        let service = BuildService(name: "Builder", access: approving(), root: root.url, deviceSupport: nil)
+        let branch = try await SharedBuilds.publish(product, platform: .iOS, commit: commit, subject: nil,
+                                                    pipeline: pipeline, root: root.url)
+        let head = String(repeating: "c", count: 40)
+        let pullRequest = PullRequest(number: 12, title: "New onboarding", author: "ada",
+                                      url: "https://github.com/o/r/pull/12", headCommit: head, headBranch: "ada/onboarding")
+        let build = try await SharedBuilds.publish(product, platform: .iOS, subject: "Onboarding",
+                                                   pullRequest: pullRequest, pipeline: pipeline, root: root.url)
+        // Not listed until its head is done building.
+        #expect(SharedBuilds.catalog(root: root.url).first?.pullRequests == nil)
+        try SharedBuilds.finishPullRequest(pullRequest, pipeline: pipeline.id, root: root.url)
+
+        let shared = SharedPullRequest(number: 12, title: "New onboarding", author: "ada",
+                                       url: "https://github.com/o/r/pull/12", branch: "ada/onboarding",
+                                       commit: head, builds: [build])
+        #expect(SharedBuilds.catalog(root: root.url) == [
+            SharedPipeline(id: pipeline.id, name: "App", builds: [branch], pullRequests: [shared]),
+        ])
+        #expect(SharedBuilds.builtPullRequests(pipeline: pipeline.id, root: root.url) == [12: head])
+        #expect(service.response(to: get("/v1/builds/\(pipeline.id.uuidString)/\(build.id.uuidString).zip")).status == 200)
+
+        // Pruning the branch's platforms leaves pull requests alone.
+        SharedBuilds.remove(pipeline: pipeline.id, keeping: [.tvOS], root: root.url)
+        #expect(SharedBuilds.archive(pipeline: pipeline.id, build: build.id, root: root.url) != nil)
+
+        // A closed pull request's builds are deleted.
+        SharedBuilds.removePullRequests(pipeline: pipeline.id, keeping: [13], root: root.url)
+        #expect(SharedBuilds.archive(pipeline: pipeline.id, build: build.id, root: root.url) == nil)
+        #expect(service.response(to: get("/v1/builds/\(pipeline.id.uuidString)/\(build.id.uuidString).zip")).status == 404)
+        #expect(SharedBuilds.catalog(root: root.url).isEmpty)
+    }
+
+    @Test func turningSharingOffRemovesPullRequestBuilds() async throws {
+        let root = try TemporaryDirectory()
+        let pipeline = PipelineConfig(name: "App")
+        let pullRequest = PullRequest(number: 3, title: "Fix", headCommit: commit)
+        let build = try await SharedBuilds.publish(try makeApp(in: root), platform: .iOS, subject: nil,
+                                                   pullRequest: pullRequest, pipeline: pipeline, root: root.url)
+        try SharedBuilds.finishPullRequest(pullRequest, pipeline: pipeline.id, root: root.url)
+        SharedBuilds.removeAll(root: root.url)
+        #expect(SharedBuilds.archive(pipeline: pipeline.id, build: build.id, root: root.url) == nil)
+    }
+
+    /// Turning "Build pull requests" off deletes what the builder shared of them, and a pull
+    /// request's failed build doesn't make the pipeline red.
+    @Test func aPipelineThatStopsBuildingPullRequestsStopsSharingThem() async throws {
+        let root = try TemporaryDirectory()
+        var config = PipelineConfig(name: "App")
+        config.buildsPullRequests = true
+        let runner = PipelineRunner(config: config, sharedRoot: root.url)
+        runner.sharesBuilds = true
+        #expect(runner.buildsPullRequests)
+        let pullRequest = PullRequest(number: 3, title: "Fix", headCommit: commit)
+        try await SharedBuilds.publish(try makeApp(in: root), platform: .iOS, subject: nil,
+                                       pullRequest: pullRequest, pipeline: config, root: root.url)
+        try SharedBuilds.finishPullRequest(pullRequest, pipeline: config.id, root: root.url)
+        runner.pullRequests = [pullRequest]
+        runner.builtPullRequests = [3: commit]
+
+        var branchRun = RunRecord(commit: commit)
+        branchRun.outcome = .succeeded
+        var failed = RunRecord(commit: commit)
+        failed.pullRequest = 3
+        failed.outcome = .failed("Build failed")
+        runner.runs = [failed, branchRun]
+        #expect(runner.lastRun?.id == branchRun.id)
+
+        runner.config.buildsPullRequests = false
+        #expect(!runner.buildsPullRequests)
+        #expect(runner.pullRequests.isEmpty)
+        #expect(runner.builtPullRequests.isEmpty)
+        #expect(SharedBuilds.builtPullRequests(pipeline: config.id, root: root.url).isEmpty)
+    }
+
     // MARK: Server and client
 
     /// A builder serving `root` on a free port, and a client connected to it.
@@ -246,6 +326,27 @@ struct SharingTests {
         let product = try await SharedBuilds.unpack(zip, into: downloads.url.appendingPathComponent("iOS"))
         #expect(product.bundleIdentifier == "com.example.app")
         #expect(try String(contentsOf: product.appURL.appendingPathComponent("binary"), encoding: .utf8) == "contents")
+    }
+
+    @Test func clientSeesTheBuildersPullRequests() async throws {
+        let root = try TemporaryDirectory()
+        let pipeline = PipelineConfig(name: "App")
+        let pullRequest = PullRequest(number: 5, title: "Dark mode", headCommit: commit)
+        let build = try await SharedBuilds.publish(try makeApp(in: root), platform: .iOS, subject: nil,
+                                                   pullRequest: pullRequest, pipeline: pipeline, root: root.url)
+        try SharedBuilds.finishPullRequest(pullRequest, pipeline: pipeline.id, root: root.url)
+        SharedBuilds.list([.init(id: pipeline.id, name: "App")], root: root.url)
+        let (server, client) = try await startServer(root: root.url)
+        defer { server.stop() }
+
+        let shared = try #require(try await client.catalog().pipelines.first?.pullRequests?.first)
+        #expect(shared.number == 5)
+        #expect(shared.builds == [build])
+        let downloads = try TemporaryDirectory()
+        let zip = downloads.url.appendingPathComponent("iOS.zip")
+        try await client.download(build, pipeline: pipeline.id, to: zip)
+        let product = try await SharedBuilds.unpack(zip, into: downloads.url.appendingPathComponent("iOS"))
+        #expect(product.bundleIdentifier == "com.example.app")
     }
 
     @Test func aClientGetsBuildsOnceTheBuilderEntersItsCode() async throws {

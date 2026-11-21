@@ -63,8 +63,17 @@ enum Git {
         at worktree: URL, repo: URL, branch: String, commit: String,
         log: @escaping @Sendable (String) -> Void
     ) async throws {
+        try await prepareWorktree(at: worktree, repo: repo, fetching: "refs/heads/\(branch)", commit: commit, log: log)
+    }
+
+    /// Fetches `ref` from the remote (say, a pull request's `refs/pull/<n>/head`) and checks
+    /// `commit` out in `worktree`.
+    static func prepareWorktree(
+        at worktree: URL, repo: URL, fetching ref: String, commit: String,
+        log: @escaping @Sendable (String) -> Void
+    ) async throws {
         if let remote = try await remote(in: repo) {
-            try await Shell.git(["fetch", "--no-tags", remote, "refs/heads/\(branch)"], in: repo, onLine: log)
+            try await Shell.git(["fetch", "--no-tags", remote, ref], in: repo, onLine: log)
         }
         let fm = FileManager.default
         let isWorktree = fm.fileExists(atPath: worktree.appendingPathComponent(".git").path)

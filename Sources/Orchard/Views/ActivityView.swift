@@ -54,6 +54,13 @@ private struct RunRow: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack {
                 OutcomeIcon(outcome: run.outcome)
+                if let number = run.pullRequest {
+                    Text("#\(number)")
+                        .monospacedDigit()
+                        .padding(.horizontal, 5)
+                        .background(.quaternary, in: .capsule)
+                        .help("A build of pull request #\(number), shared with clients")
+                }
                 Text(run.commit.shortSHA).monospaced()
                 Text(run.subject ?? "")
                     .lineLimit(1)

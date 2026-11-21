@@ -78,6 +78,10 @@ struct PipelineSettingsView: View {
 
             DevicesSection(runner: runner)
 
+            if store.sharesBuilds, !runner.config.isRemote {
+                PullRequestsSection(runner: runner)
+            }
+
             Section(runner.config.isRemote ? "Updates" : "Polling") {
                 Picker("Check every", selection: $runner.config.pollInterval) {
                     ForEach([30.0, 60, 120, 300, 900], id: \.self) { seconds in
@@ -239,6 +243,73 @@ struct PipelineSettingsView: View {
 }
 
 // MARK: - Devices
+
+/// Builder: whether the pipeline also builds the repository's open pull requests for clients,
+/// and how each one stands.
+private struct PullRequestsSection: View {
+    @Bindable var runner: PipelineRunner
+
+    var body: some View {
+        Section {
+            Toggle("Build pull requests", isOn: Binding(
+                get: { runner.config.buildsPullRequests ?? false },
+                set: { runner.config.buildsPullRequests = $0 }))
+            if runner.buildsPullRequests {
+                if let error = runner.pullRequestError {
+                    Text(error).foregroundStyle(.orange).font(.callout)
+                } else if runner.pullRequests.isEmpty {
+                    Text(runner.config.isEnabled ? "No open pull requests" : "Enable the pipeline to build pull requests")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(runner.pullRequests) { pullRequest in
+                    PullRequestRow(pullRequest: pullRequest, state: state(of: pullRequest))
+                }
+            }
+        } header: {
+            Text("Pull Requests")
+        } footer: {
+            Text("Builds the \(GitHub.pullRequestLimit) most recently updated open pull requests for clients, after the branch. Pull requests from forks aren't built. Needs the GitHub CLI (gh), logged in on this Mac.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func state(of pullRequest: PullRequest) -> PullRequestRow.State {
+        if runner.currentPullRequest == pullRequest.number { return .building }
+        if runner.builtPullRequests[pullRequest.number] == pullRequest.headCommit { return .built }
+        if runner.attemptedPullRequests[pullRequest.number] == pullRequest.headCommit { return .failed }
+        return .waiting
+    }
+}
+
+private struct PullRequestRow: View {
+    enum State { case waiting, building, built, failed }
+    let pullRequest: PullRequest
+    let state: State
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text("#\(pullRequest.number)").monospacedDigit().foregroundStyle(.secondary)
+            Text(pullRequest.title).lineLimit(1).truncationMode(.tail)
+            if pullRequest.isDraft {
+                Text("Draft").font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Text(pullRequest.headCommit.shortSHA).monospaced().foregroundStyle(.secondary)
+            switch state {
+            case .waiting:
+                Image(systemName: "clock").foregroundStyle(.secondary).help("Waiting to be built")
+            case .building:
+                ProgressView().controlSize(.small).help("Building")
+            case .built:
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green).help("Built and shared with clients")
+            case .failed:
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.red).help("The build failed; see the deploy list")
+            }
+        }
+        .help(pullRequest.author.map { "\(pullRequest.title) by \($0)" } ?? pullRequest.title)
+    }
+}
 
 private struct DevicesSection: View {
     @Bindable var runner: PipelineRunner
