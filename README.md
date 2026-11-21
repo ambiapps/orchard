@@ -62,6 +62,7 @@ Things to know:
 - Development builds need Developer Mode on the phone.
 - Only Macs approved on the builder can download builds; each has its own token. Traffic is plain HTTP, though, so use it on a network you trust or over a VPN. Links from Orchard 1.0.15 and earlier still work, but each client has to be approved once.
 - The builder keeps one build per pipeline and platform, the latest.
+- **Build pull requests** (a builder pipeline's setting) also builds the repository's open pull requests, the 10 most recently updated, after the branch and one at a time, in a checkout of their own. It lists them with the GitHub CLI, so `gh` has to be installed and logged in on the builder. Pull requests from forks aren't built, since their build scripts would run on the builder. A pull request's builds are shared next to the branch's, and are deleted when it's closed or merged. Clients can't install them yet.
 
 ## How it works
 

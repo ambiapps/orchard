@@ -44,8 +44,15 @@ final class PipelineRunner: Identifiable {
             onChange?()
             checkProvisioning()
             if config.isEnabled != oldValue.isEnabled { config.isEnabled ? start() : stop() }
+            if config.buildsPullRequests != oldValue.buildsPullRequests {
+                if !buildsPullRequests {
+                    stopBuildingPullRequests()
+                } else if config.isEnabled {
+                    Task { await checkPullRequests() }
+                }
+            }
             if config.keptRuns < oldValue.keptRuns {
-                runs = Array(runs.prefix(config.keptRuns))
+                runs = runs.keepingRuns(config.keptRuns)
                 log = log.keepingRuns(config.keptRuns)
                 history?.replaceLog(with: log)
             }
@@ -93,7 +100,22 @@ final class PipelineRunner: Identifiable {
     @ObservationIgnored private var newDevices: [Device] = []
     @ObservationIgnored private let deployer: DeployAction
     /// Whether this Mac is a builder: each build is then also zipped for its clients. Set by `AppStore`.
-    var sharesBuilds = false
+    var sharesBuilds = false {
+        didSet { if oldValue, !sharesBuilds { stopBuildingPullRequests() } }
+    }
+    /// Builder: the open pull requests it builds, as of the last time it asked GitHub.
+    /// These four are set by `checkPullRequests`; tests and screenshots set them directly.
+    var pullRequests: [PullRequest] = []
+    /// Builder: the head commit last built of each pull request, by number.
+    var builtPullRequests: [Int: String] = [:]
+    /// Builder: the head commit last tried of each pull request, so one that fails to build
+    /// isn't built again until it gets a new commit.
+    var attemptedPullRequests: [Int: String] = [:]
+    /// Builder: the pull request being built now.
+    var currentPullRequest: Int?
+    /// Builder: why the pull requests couldn't be listed (no `gh`, not logged in).
+    private(set) var pullRequestError: String?
+    @ObservationIgnored private var checkingPullRequests = false
     /// The builder a remote pipeline (`config.remoteID`) gets its builds from. Set by `AppStore`.
     @ObservationIgnored var builder: BuilderClient?
     @ObservationIgnored private let sharedRoot: URL
@@ -126,7 +148,8 @@ final class PipelineRunner: Identifiable {
         if config.isEnabled { start() }
     }
 
-    var lastRun: RunRecord? { runs.first }
+    /// The newest run of the branch; a pull request's build doesn't make the pipeline red.
+    var lastRun: RunRecord? { runs.first { $0.pullRequest == nil } }
 
     private func checkProvisioning() {
         // Runs are newest first; going oldest to newest leaves each platform its newest app.
@@ -174,6 +197,7 @@ final class PipelineRunner: Identifiable {
             return "\(status.label) \(Int(downloadProgress * 100))%"
         }
         if isWaitingForBuild, !status.isBusy { return config.isEnabled ? "Waiting for a build" : "No build yet" }
+        if let currentPullRequest, status.isBusy { return "#\(currentPullRequest): \(status.label)" }
         return status.label
     }
 
@@ -191,6 +215,7 @@ final class PipelineRunner: Identifiable {
                 guard let self else { return }
                 await self.check(force: false)
                 await self.deployToNewDevices()
+                await self.checkPullRequests()
                 let interval = max(10, self.config.pollInterval)
                 self.nextCheck = Date().addingTimeInterval(interval)
                 try? await Task.sleep(for: .seconds(interval))
@@ -362,7 +387,7 @@ final class PipelineRunner: Identifiable {
         var record = RunRecord(commit: commit, baseCommit: config.lastDeployedCommit, logFile: logFile.url)
         for device in config.devices { record.deviceOutcomes[device.id] = .pending }
         runs.insert(record, at: 0)
-        if runs.count > config.keptRuns { runs.removeLast(runs.count - config.keptRuns) }
+        runs = runs.keepingRuns(config.keptRuns)
 
         func update(_ change: (inout RunRecord) -> Void) {
             guard let index = runs.firstIndex(where: { $0.id == record.id }) else { return }
@@ -654,7 +679,7 @@ final class PipelineRunner: Identifiable {
                                baseCommit: config.lastDeployedCommit, logFile: logFile.url)
         for device in config.devices { record.deviceOutcomes[device.id] = .pending }
         runs.insert(record, at: 0)
-        if runs.count > config.keptRuns { runs.removeLast(runs.count - config.keptRuns) }
+        runs = runs.keepingRuns(config.keptRuns)
 
         func update(_ change: (inout RunRecord) -> Void) {
             guard let index = runs.firstIndex(where: { $0.id == record.id }) else { return }
@@ -727,6 +752,189 @@ final class PipelineRunner: Identifiable {
         logFile.close()
     }
 
+    // MARK: Pull requests
+
+    /// Whether this pipeline builds its repository's pull requests for clients.
+    var buildsPullRequests: Bool {
+        sharesBuilds && !config.isRemote && config.buildsPullRequests == true
+    }
+
+    /// Builder: lists the open pull requests and builds each one whose head hasn't been built,
+    /// one at a time. The branch goes first: it's checked again before each pull request.
+    func checkPullRequests() async {
+        guard buildsPullRequests, missingSetup == nil, runTask == nil, !status.isBusy, !checkingPullRequests,
+              let repo = config.repoURL else { return }
+        // Turning the setting on starts a check while the poll loop may be in one.
+        checkingPullRequests = true
+        defer { checkingPullRequests = false }
+        let open: [PullRequest]
+        do {
+            open = GitHub.selection(try await GitHub.openPullRequests(in: repo))
+        } catch is CancellationError {
+            return
+        } catch {
+            // The same answer on every poll (gh missing, logged out) is logged once.
+            if pullRequestError != error.localizedDescription {
+                append(.error, error.localizedDescription)
+            }
+            pullRequestError = error.localizedDescription
+            return
+        }
+        // Turned off while gh was asked.
+        guard buildsPullRequests else { return }
+        pullRequestError = nil
+        pullRequests = open
+        // Closed, merged, and no longer among the most recently updated.
+        SharedBuilds.removePullRequests(pipeline: config.id, keeping: Set(open.map(\.number)), root: sharedRoot)
+        builtPullRequests = SharedBuilds.builtPullRequests(pipeline: config.id, root: sharedRoot)
+        attemptedPullRequests = attemptedPullRequests.filter { number, _ in open.contains { $0.number == number } }
+
+        for pullRequest in GitHub.needingBuild(open, built: builtPullRequests, attempted: attemptedPullRequests) {
+            // The branch, a rebuild for a client's registered device and new devices go first.
+            await check(force: false)
+            await rebuildIfQueued()
+            await deployToNewDevices()
+            guard buildsPullRequests, config.isEnabled, runTask == nil, !status.isBusy else { return }
+            // Not trimmed here: the log keeps a number of the branch's runs, and its line cap.
+            append(.step, "Pull request #\(pullRequest.number) “\(pullRequest.title)” @ \(pullRequest.headCommit.shortSHA)",
+                   startsRun: true, pullRequest: pullRequest.number)
+            let snapshot = config
+            let task = Task { await self.runPullRequest(pullRequest, config: snapshot) }
+            runTask = task
+            await task.value
+            runTask = nil
+            resumeQueuedRebuild()
+        }
+    }
+
+    /// Builds a pull request's head for every device platform the pipeline shares and
+    /// publishes the builds. Nothing is deployed, and the branch's state isn't touched.
+    private func runPullRequest(_ pullRequest: PullRequest, config: PipelineConfig) async {
+        guard let repo = config.repoURL, let scheme = config.scheme else { return }
+        let commit = pullRequest.headCommit
+        attemptedPullRequests[pullRequest.number] = commit
+        currentPullRequest = pullRequest.number
+        defer {
+            currentPullRequest = nil
+            status = config.isEnabled ? .idle : .disabled
+        }
+
+        let logFile = LogFile(pipeline: config, commit: commit)
+        var record = RunRecord(commit: commit, logFile: logFile.url)
+        record.pullRequest = pullRequest.number
+        runs.insert(record, at: 0)
+        runs = runs.keepingRuns(config.keptRuns)
+
+        func update(_ change: (inout RunRecord) -> Void) {
+            guard let index = runs.firstIndex(where: { $0.id == record.id }) else { return }
+            change(&runs[index])
+        }
+
+        let raw = logger(file: logFile, condensed: false)
+        let build = logger(file: logFile, condensed: true)
+        let dirs = Paths.pipeline(config.id).pullRequestBuild
+        let runStart = Date()
+        var timings = RunTimings()
+
+        do {
+            status = .preparing
+            append(.step, "Checking out \(pullRequest.ref) @ \(commit.shortSHA)")
+            try await Git.prepareWorktree(at: dirs.checkout, repo: repo, fetching: pullRequest.ref,
+                                          commit: commit, log: raw)
+            let subject = await Git.subject(of: commit, in: dirs.checkout)
+            update { $0.subject = subject }
+            timings.checkout = Date().timeIntervalSince(runStart)
+            update { $0.timings = timings }
+
+            // Only what clients can install: a pull request's build isn't deployed here.
+            var platforms = config.buildPlatforms.filter { !$0.isSimulator }
+            if config.alsoBuilds == nil {
+                append(.step, "Looking up the platforms \(scheme) supports")
+                do {
+                    platforms.formUnion(try await Xcode.supportedPlatforms(
+                        container: config.containerPath, scheme: scheme, in: dirs.checkout))
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch where !platforms.isEmpty {
+                    append(.warning, "Couldn't look up the platforms \(scheme) supports: \(error.localizedDescription)")
+                }
+            }
+            guard !platforms.isEmpty else { throw PullRequestBuildError.noPlatforms }
+
+            var built: [BuildPlatform] = []
+            var failed: [BuildPlatform] = []
+            for platform in BuildPlatform.allCases where platforms.contains(platform) {
+                try Task.checkCancellation()
+                status = .building(platform)
+                append(.step, "Building \(scheme) (\(config.configuration)) for \(platform.displayName)")
+                let buildStart = Date()
+                do {
+                    let product = try await Xcode.build(
+                        container: config.containerPath, scheme: scheme, configuration: config.configuration,
+                        platform: platform, in: dirs.checkout, derivedData: dirs.derivedData, log: build)
+                    timings.build += Date().timeIntervalSince(buildStart)
+                    update { $0.timings = timings }
+                    append(.success, "Built \(product.appURL.lastPathComponent) in \(Date().timeIntervalSince(buildStart).formattedDuration)")
+                    let shared = try await SharedBuilds.publish(
+                        product, platform: platform, subject: subject, pullRequest: pullRequest,
+                        pipeline: self.config, root: sharedRoot)
+                    append(.info, "Sharing the \(platform.displayName) build with clients (\(shared.size.formattedSize))")
+                    built.append(platform)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    timings.build += Date().timeIntervalSince(buildStart)
+                    update { $0.timings = timings }
+                    append(.error, "Build for \(platform.displayName) failed after \(Date().timeIntervalSince(buildStart).formattedDuration)")
+                    raw("BUILD FAILED: \(error.localizedDescription)")
+                    failed.append(platform)
+                }
+            }
+
+            let took = timings.summary(total: Date().timeIntervalSince(runStart))
+            guard !built.isEmpty else { throw PullRequestBuildError.buildFailed }
+            try SharedBuilds.finishPullRequest(pullRequest, pipeline: config.id, root: sharedRoot)
+            builtPullRequests[pullRequest.number] = commit
+            if failed.isEmpty {
+                update { $0.outcome = .succeeded }
+                append(.success, "Built #\(pullRequest.number) @ \(commit.shortSHA) for clients in \(took)")
+            } else {
+                let names = BuildPlatform.allCases.filter(failed.contains).map(\.displayName).joined(separator: ", ")
+                update { $0.outcome = .warning("Couldn't build for \(names)") }
+                append(.warning, "Built #\(pullRequest.number) @ \(commit.shortSHA), but not for \(names), in \(took)")
+            }
+        } catch is CancellationError {
+            update { $0.outcome = .failed("Cancelled") }
+            append(.warning, "Cancelled after \(Date().timeIntervalSince(runStart).formattedDuration)")
+        } catch {
+            update { $0.outcome = .failed(error.localizedDescription) }
+            append(.error, "#\(pullRequest.number): \(error.localizedDescription) (after \(Date().timeIntervalSince(runStart).formattedDuration))")
+            Notifier.post(title: "\(config.name) #\(pullRequest.number) failed", body: error.localizedDescription)
+        }
+        update { $0.finishedAt = Date() }
+        logFile.close()
+    }
+
+    /// Stops building pull requests and deletes their builds and checkout, when the pipeline
+    /// or the builder stops building them.
+    private func stopBuildingPullRequests() {
+        if currentPullRequest != nil { runTask?.cancel() }
+        pullRequests = []
+        builtPullRequests = [:]
+        attemptedPullRequests = [:]
+        pullRequestError = nil
+        SharedBuilds.removePullRequests(pipeline: config.id, root: sharedRoot)
+        let dirs = Paths.pipeline(config.id).pullRequestBuild
+        let repo = config.repoURL
+        Task {
+            // A cancelled build may still be stopping xcodebuild.
+            while runTask != nil { try? await Task.sleep(for: .milliseconds(200)) }
+            guard !buildsPullRequests else { return }
+            if let repo { await Git.removeWorktree(at: dirs.checkout, repo: repo) }
+            try? FileManager.default.removeItem(at: dirs.root)
+        }
+    }
+
     /// Deploys a device again from a run's build, if that build is still in DerivedData.
     func canRedeploy(_ device: Device, from run: RunRecord) -> Bool {
         guard !status.isBusy, run.deviceOutcomes[device.id]?.canRetry == true,
@@ -772,7 +980,7 @@ final class PipelineRunner: Identifiable {
         update { $0.outcome = outcome }
         // The newest attempt is now installed on every device, so it counts as deployed.
         let failed = if case .failed = outcome { true } else { false }
-        if !failed, runs.first?.id == run.id, run.commit == config.lastAttemptedCommit {
+        if !failed, lastRun?.id == run.id, run.commit == config.lastAttemptedCommit {
             config.lastDeployedCommit = run.commit
             config.lastDeployedAt = Date()
         }
@@ -860,14 +1068,17 @@ final class PipelineRunner: Identifiable {
         loopTask?.cancel()
         runTask?.cancel()
         let dirs = Paths.pipeline(config.id)
-        if let repo = config.repoURL { await Git.removeWorktree(at: dirs.checkout, repo: repo) }
+        if let repo = config.repoURL {
+            await Git.removeWorktree(at: dirs.checkout, repo: repo)
+            await Git.removeWorktree(at: dirs.pullRequestBuild.checkout, repo: repo)
+        }
         try? FileManager.default.removeItem(at: dirs.root)
     }
 
     // MARK: Logging
 
-    private func append(_ level: LogLine.Level, _ text: String, startsRun: Bool = false) {
-        let line = LogLine(level: level, text: text, startsRun: startsRun ? true : nil)
+    private func append(_ level: LogLine.Level, _ text: String, startsRun: Bool = false, pullRequest: Int? = nil) {
+        let line = LogLine(level: level, text: text, startsRun: startsRun ? true : nil, pullRequest: pullRequest)
         log.append(line)
         if log.count > Self.maxLogLines { log = log.keepingLines(Self.maxLogLines) }
         history?.appendLog(line)
@@ -905,6 +1116,18 @@ final class PipelineRunner: Identifiable {
 
 // MARK: - Support
 
+enum PullRequestBuildError: LocalizedError {
+    case noPlatforms
+    case buildFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .noPlatforms: "There's no device platform to build for."
+        case .buildFailed: "Build failed"
+        }
+    }
+}
+
 enum Paths {
     static let appSupport: URL = {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -924,6 +1147,9 @@ enum Paths {
         var derivedData: URL { root.appendingPathComponent("DerivedData", isDirectory: true) }
         /// Builds a client downloaded from its builder, one folder per platform.
         var downloads: URL { root.appendingPathComponent("Downloads", isDirectory: true) }
+        /// A builder's checkout and DerivedData for pull requests, apart from the branch's so
+        /// that its builds stay incremental.
+        var pullRequestBuild: PipelineDirs { PipelineDirs(root: root.appendingPathComponent("PullRequestBuild", isDirectory: true)) }
     }
 
     static func pipeline(_ id: UUID) -> PipelineDirs {

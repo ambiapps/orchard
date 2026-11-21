@@ -137,6 +137,8 @@ struct ContentViewLayoutTests {
             try builderSnapshot(appearance: appearance, to: directory.appendingPathComponent("builder-\(name).png"))
             try builderSnapshot(appearance: appearance, hosted: true,
                                 to: directory.appendingPathComponent("builder-no-devices-\(name).png"))
+            try builderSnapshot(appearance: appearance, hosted: true, pullRequests: true,
+                                to: directory.appendingPathComponent("pull-requests-\(name).png"))
 
             let store = makeTestStore()
             let runner = store.pipelines[0]
@@ -218,7 +220,9 @@ struct ContentViewLayoutTests {
 
     /// A builder's pipeline, with the platform it also builds for its clients, or with no devices
     /// and no platform chosen (`hosted`), when it builds every platform the scheme supports.
-    private func builderSnapshot(appearance: NSAppearance.Name, hosted: Bool = false, to url: URL) throws {
+    /// With `pullRequests`, it also builds the repository's open pull requests.
+    private func builderSnapshot(appearance: NSAppearance.Name, hosted: Bool = false, pullRequests: Bool = false,
+                                 to url: URL) throws {
         let store = makeTestStore()
         store.sharesBuilds = true
         let runner = store.pipelines[0]
@@ -228,6 +232,32 @@ struct ContentViewLayoutTests {
             runner.config.scheme = "App"
         } else {
             runner.config.alsoBuilds = .iOS
+        }
+        if pullRequests {
+            runner.config.buildsPullRequests = true
+            func sha(_ digit: Character) -> String { String(repeating: digit, count: 40) }
+            runner.pullRequests = [
+                PullRequest(number: 48, title: "Redesign the flight card", author: "ada", headCommit: sha("4")),
+                PullRequest(number: 47, title: "Dark mode for the map", author: "grace", headCommit: sha("7"), isDraft: true),
+                PullRequest(number: 45, title: "Larger tap targets in settings", author: "ada", headCommit: sha("5")),
+                PullRequest(number: 41, title: "Try a new onboarding flow", author: "linus", headCommit: sha("1")),
+            ]
+            runner.currentPullRequest = 48
+            runner.builtPullRequests = [47: sha("7"), 45: sha("5")]
+            runner.attemptedPullRequests = [41: sha("1")]
+            var runs = sampleRuns(device: "none")
+            for index in runs.indices { runs[index].deviceOutcomes = [:] }
+            var built = RunRecord(commit: sha("7"), subject: "Use semantic colors on the map",
+                                  startedAt: Date().addingTimeInterval(-1500))
+            built.pullRequest = 47
+            built.outcome = .succeeded
+            built.finishedAt = built.startedAt.addingTimeInterval(212)
+            var failed = RunRecord(commit: sha("1"), subject: "Onboarding: first pass",
+                                   startedAt: Date().addingTimeInterval(-2400))
+            failed.pullRequest = 41
+            failed.outcome = .failed("Build failed")
+            failed.finishedAt = failed.startedAt.addingTimeInterval(95)
+            runner.runs = [built, failed] + runs
         }
         let view = ContentView()
             .environment(store)

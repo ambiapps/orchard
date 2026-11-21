@@ -153,6 +153,9 @@ struct PipelineConfig: Codable, Hashable, Identifiable, Sendable {
     /// The builder's builds (`SharedBuild.id`s) this client last tried to install, so a build
     /// that failed isn't downloaded again on every poll.
     var lastRemoteBuild: String?
+    /// Builder: also build the open pull requests of the repository (through `gh`) and share
+    /// them with clients. Optional so older saved configs decode.
+    var buildsPullRequests: Bool?
 
     /// Last commit installed on every device (launching it may have failed, e.g. on a locked phone).
     var lastDeployedCommit: String?
@@ -220,6 +223,9 @@ struct RunRecord: Identifiable, Sendable, Codable {
     /// building a platform again overwrites its app, so a newer run removes it from older ones.
     /// Optional so older saved runs decode.
     var products: [String: BuiltProduct]?
+    /// Set on a builder's build of a pull request (its number), which is only shared, not
+    /// deployed. Optional so older saved runs decode.
+    var pullRequest: Int?
 
     func product(for platform: BuildPlatform) -> BuiltProduct? { products?[platform.rawValue] }
 
@@ -264,6 +270,21 @@ extension DeployOutcome {
 }
 
 extension [RunRecord] {
+    /// Keeps the newest `count` runs of the branch and, apart from them, the newest `count`
+    /// builds of pull requests, so a busy set of pull requests doesn't push out the branch's.
+    func keepingRuns(_ count: Int) -> [RunRecord] {
+        var branch = 0
+        var pullRequests = 0
+        return filter { run in
+            if run.pullRequest == nil {
+                branch += 1
+                return branch <= count
+            }
+            pullRequests += 1
+            return pullRequests <= count
+        }
+    }
+
     /// Drops the apps of every run but `keeping`, because a new build overwrites what DerivedData
     /// holds: not just its own platform's app, but embedded ones too (an iOS build writes its
     /// watch app to the watchOS products folder).
@@ -282,14 +303,18 @@ struct LogLine: Identifiable, Sendable, Codable {
     let text: String
     /// Marks the first line of a build, so the log can keep a number of builds.
     var startsRun: Bool?
+    /// On the first line of a pull request's build, its number: `keepingRuns` counts only the
+    /// branch's runs. Optional so older saved lines decode.
+    var pullRequest: Int?
 
-    private enum CodingKeys: String, CodingKey { case date, level, text, startsRun }
+    private enum CodingKeys: String, CodingKey { case date, level, text, startsRun, pullRequest }
 }
 
 extension [LogLine] {
-    /// The lines from the start of the last `count` runs on.
+    /// The lines from the start of the last `count` runs of the branch on, with the pull
+    /// request builds among them.
     func keepingRuns(_ count: Int) -> [LogLine] {
-        let starts = indices.filter { self[$0].startsRun == true }
+        let starts = indices.filter { self[$0].startsRun == true && self[$0].pullRequest == nil }
         guard starts.count > count else { return self }
         return count == 0 ? [] : Array(self[starts[starts.count - count]...])
     }
