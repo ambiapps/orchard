@@ -303,14 +303,18 @@ struct LogLine: Identifiable, Sendable, Codable {
     let text: String
     /// Marks the first line of a build, so the log can keep a number of builds.
     var startsRun: Bool?
+    /// On the first line of a pull request's build, its number: `keepingRuns` counts only the
+    /// branch's runs. Optional so older saved lines decode.
+    var pullRequest: Int?
 
-    private enum CodingKeys: String, CodingKey { case date, level, text, startsRun }
+    private enum CodingKeys: String, CodingKey { case date, level, text, startsRun, pullRequest }
 }
 
 extension [LogLine] {
-    /// The lines from the start of the last `count` runs on.
+    /// The lines from the start of the last `count` runs of the branch on, with the pull
+    /// request builds among them.
     func keepingRuns(_ count: Int) -> [LogLine] {
-        let starts = indices.filter { self[$0].startsRun == true }
+        let starts = indices.filter { self[$0].startsRun == true && self[$0].pullRequest == nil }
         guard starts.count > count else { return self }
         return count == 0 ? [] : Array(self[starts[starts.count - count]...])
     }

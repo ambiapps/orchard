@@ -115,6 +115,7 @@ final class PipelineRunner: Identifiable {
     var currentPullRequest: Int?
     /// Builder: why the pull requests couldn't be listed (no `gh`, not logged in).
     private(set) var pullRequestError: String?
+    @ObservationIgnored private var checkingPullRequests = false
     /// The builder a remote pipeline (`config.remoteID`) gets its builds from. Set by `AppStore`.
     @ObservationIgnored var builder: BuilderClient?
     @ObservationIgnored private let sharedRoot: URL
@@ -761,8 +762,11 @@ final class PipelineRunner: Identifiable {
     /// Builder: lists the open pull requests and builds each one whose head hasn't been built,
     /// one at a time. The branch goes first: it's checked again before each pull request.
     func checkPullRequests() async {
-        guard buildsPullRequests, missingSetup == nil, runTask == nil, !status.isBusy,
+        guard buildsPullRequests, missingSetup == nil, runTask == nil, !status.isBusy, !checkingPullRequests,
               let repo = config.repoURL else { return }
+        // Turning the setting on starts a check while the poll loop may be in one.
+        checkingPullRequests = true
+        defer { checkingPullRequests = false }
         let open: [PullRequest]
         do {
             open = GitHub.selection(try await GitHub.openPullRequests(in: repo))
@@ -786,17 +790,20 @@ final class PipelineRunner: Identifiable {
         attemptedPullRequests = attemptedPullRequests.filter { number, _ in open.contains { $0.number == number } }
 
         for pullRequest in GitHub.needingBuild(open, built: builtPullRequests, attempted: attemptedPullRequests) {
+            // The branch, a rebuild for a client's registered device and new devices go first.
             await check(force: false)
+            await rebuildIfQueued()
+            await deployToNewDevices()
             guard buildsPullRequests, config.isEnabled, runTask == nil, !status.isBusy else { return }
-            log = log.keepingRuns(config.keptRuns - 1)
-            history?.replaceLog(with: log)
+            // Not trimmed here: the log keeps a number of the branch's runs, and its line cap.
             append(.step, "Pull request #\(pullRequest.number) “\(pullRequest.title)” @ \(pullRequest.headCommit.shortSHA)",
-                   startsRun: true)
+                   startsRun: true, pullRequest: pullRequest.number)
             let snapshot = config
             let task = Task { await self.runPullRequest(pullRequest, config: snapshot) }
             runTask = task
             await task.value
             runTask = nil
+            resumeQueuedRebuild()
         }
     }
 
@@ -973,7 +980,7 @@ final class PipelineRunner: Identifiable {
         update { $0.outcome = outcome }
         // The newest attempt is now installed on every device, so it counts as deployed.
         let failed = if case .failed = outcome { true } else { false }
-        if !failed, runs.first?.id == run.id, run.commit == config.lastAttemptedCommit {
+        if !failed, lastRun?.id == run.id, run.commit == config.lastAttemptedCommit {
             config.lastDeployedCommit = run.commit
             config.lastDeployedAt = Date()
         }
@@ -1070,8 +1077,8 @@ final class PipelineRunner: Identifiable {
 
     // MARK: Logging
 
-    private func append(_ level: LogLine.Level, _ text: String, startsRun: Bool = false) {
-        let line = LogLine(level: level, text: text, startsRun: startsRun ? true : nil)
+    private func append(_ level: LogLine.Level, _ text: String, startsRun: Bool = false, pullRequest: Int? = nil) {
+        let line = LogLine(level: level, text: text, startsRun: startsRun ? true : nil, pullRequest: pullRequest)
         log.append(line)
         if log.count > Self.maxLogLines { log = log.keepingLines(Self.maxLogLines) }
         history?.appendLog(line)

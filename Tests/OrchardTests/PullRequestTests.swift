@@ -74,6 +74,19 @@ struct PullRequestTests {
         #expect(kept.map(\.pullRequest) == [nil, 1, 2, nil])
     }
 
+    /// Pull request builds in the log don't count toward the branch's runs it keeps.
+    @Test func theLogKeepsTheBranchsRunsWhateverPullRequestsBuilt() {
+        let lines = [
+            LogLine(level: .step, text: "branch 1", startsRun: true),
+            LogLine(level: .step, text: "pr 5", startsRun: true, pullRequest: 5),
+            LogLine(level: .step, text: "branch 2", startsRun: true),
+            LogLine(level: .step, text: "pr 6", startsRun: true, pullRequest: 6),
+            LogLine(level: .step, text: "pr 7", startsRun: true, pullRequest: 7),
+        ]
+        #expect(lines.keepingRuns(1).map(\.text) == ["branch 2", "pr 6", "pr 7"])
+        #expect(lines.keepingRuns(2).count == 5)
+    }
+
     @Test func configsAndRunsSavedBeforePullRequestsDecode() throws {
         let config = try JSONDecoder().decode(PipelineConfig.self, from: Data(
             #"{"id":"8D4D0A0E-6B1E-4C3A-9B57-1A2B3C4D5E6F","name":"App","configuration":"Debug","pollInterval":60,"isEnabled":true,"devices":[]}"#.utf8))
